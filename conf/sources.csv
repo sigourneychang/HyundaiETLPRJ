@@ -1,0 +1,23 @@
+# Tables to migrate (source cluster -> target cluster, same db/table name).
+# One table per line: db,table
+#   - write * as the table to migrate every table/view in that db
+#   - lines starting with # are ignored
+db,table
+
+# --- external tables
+sample_db,ext_orc
+sample_db,ext_parquet
+sample_db,ext_text
+sample_db,ext_orc_part
+
+# --- managed tables
+sample_db,mng_orc
+sample_db,mng_parquet
+sample_db,mng_text
+sample_db,mng_orc_part
+
+# --- ACID table
+sample_db,acid_orc
+
+# --- views
+sample_db,v_ext_orc

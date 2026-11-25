@@ -1,0 +1,1070 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hive 이관</title>
+<style>
+:root {
+  --bg: #f4f5f7; --panel: #fff; --line: #dfe1e6; --text: #172b4d; --muted: #6b778c;
+  --accent: #0c66e4; --accent-bg: #e9f2ff; --hover: #f1f2f4; --sel: #e9f2ff;
+  --ok: #1f845a; --ok-bg: #dcfff1; --bad: #c9372c; --bad-bg: #ffeceb;
+  --warn: #a54800; --warn-bg: #fff3d6; --run: #0c66e4; --run-bg: #e9f2ff;
+  --wait: #626f86; --wait-bg: #f1f2f4;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--text); font: 13px/1.4 -apple-system, BlinkMacSystemFont,
+       "Apple SD Gothic Neo", "Malgun Gothic", "Segoe UI", sans-serif;
+       display: flex; flex-direction: column; overflow: hidden; }
+button, select, input { font: inherit; color: inherit; }
+button { border: 1px solid var(--line); background: var(--panel); border-radius: 4px; padding: 5px 12px;
+         cursor: pointer; white-space: nowrap; }
+button:hover:not(:disabled) { background: var(--hover); }
+button:disabled { opacity: .45; cursor: default; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:hover:not(:disabled) { background: #0055cc; }
+button.danger { color: var(--bad); border-color: #f5b5b0; }
+select, input[type=number], input[type=search] { border: 1px solid var(--line); border-radius: 4px;
+       padding: 4px 6px; background: var(--panel); }
+input[type=search] { width: 100%; }
+
+header { display: flex; align-items: center; gap: 16px; padding: 8px 16px; background: var(--panel);
+         border-bottom: 1px solid var(--line); }
+header h1 { font-size: 15px; margin: 0; }
+header .meta { color: var(--muted); display: flex; gap: 16px; flex: 1; min-width: 0; }
+header .meta span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+main { flex: 1; display: grid; grid-template-columns: minmax(0, 1.25fr) 112px minmax(0, 1fr) minmax(0, 1fr);
+       gap: 0; min-height: 0; padding: 12px 16px 0; }
+main > .panel + .panel { margin-left: 12px; }
+.panel-head .title { flex-wrap: wrap; row-gap: 4px; }
+.panel-head .title b, .panel-head .title .sub { white-space: nowrap; }
+.panel-head .title .tools { margin-left: auto; display: flex; gap: 4px; }
+.small { padding: 2px 8px; font-size: 12px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; display: flex;
+         flex-direction: column; min-height: 0; }
+.panel-head { padding: 8px 10px; border-bottom: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px; }
+.panel-head .title { display: flex; align-items: baseline; gap: 8px; }
+.panel-head .title b { font-size: 14px; }
+.panel-head .title .sub { color: var(--muted); }
+.panel-head .row { display: flex; gap: 6px; }
+.tree { flex: 1; overflow: auto; padding: 4px 0; }
+.empty { color: var(--muted); padding: 24px; text-align: center; }
+
+.node { display: flex; align-items: center; gap: 6px; padding: 3px 10px; cursor: default; white-space: nowrap; }
+.node:hover { background: var(--hover); }
+.node.db { font-weight: 600; }
+.node.tbl { padding-left: 34px; }
+.node.picked { background: var(--sel); }
+.node .caret { width: 14px; text-align: center; color: var(--muted); cursor: pointer; user-select: none; }
+.node .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.node .num { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 64px; text-align: right; font-weight: 400; }
+.node.disabled .name { color: var(--muted); text-decoration: line-through; }
+.node.clickable { cursor: pointer; }
+
+.badge { font-size: 11px; padding: 0 5px; border-radius: 3px; border: 1px solid var(--line); color: var(--muted);
+         font-weight: 500; min-width: 30px; text-align: center; }
+.badge.ACID { color: var(--warn); border-color: #f8d08a; background: var(--warn-bg); }
+.badge.VIEW { color: #6e5dc6; border-color: #d6cdf9; }
+.badge.UNSUPPORTED, .badge.ERROR { color: var(--bad); border-color: #f5b5b0; }
+
+.st { font-size: 11px; padding: 1px 6px; border-radius: 10px; font-weight: 600; white-space: nowrap; }
+.st.OK { color: var(--ok); background: var(--ok-bg); }
+.st.MISMATCH, .st.FAILED { color: var(--bad); background: var(--bad-bg); }
+.st.RUNNING { color: var(--run); background: var(--run-bg); }
+.st.PENDING, .st.QUEUED, .st.READY { color: var(--wait); background: var(--wait-bg); }
+.st.SKIPPED, .st.DRY-RUN, .st.STOPPED, .st.NOT { color: var(--warn); background: var(--warn-bg); }
+.st.DELQ, .st.DELETING, .st.DROPPED { color: var(--bad); background: var(--bad-bg); }
+.rename { color: var(--accent); font-weight: 600; }
+button.small.icon { padding: 0 6px; border-color: transparent; background: none; color: var(--muted); }
+button.small.icon:hover { color: var(--accent); background: var(--hover); }
+.st.WAIT, .st.NOREC { color: var(--muted); background: var(--hover); font-weight: 500; }
+.st.EMPTY, .st.NODB { color: var(--muted); background: var(--hover); font-weight: 500; }
+button.small.danger { color: var(--bad); border-color: #f5b5b0; }
+.dbsum { display: flex; gap: 4px; font-weight: 400; }
+.mark { font-size: 11px; color: var(--accent); }
+
+.mid { display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 10px; padding: 0 8px; }
+.mid button { width: 100%; padding: 8px 0; }
+.mid .hint { color: var(--muted); font-size: 11px; text-align: center; }
+
+footer { padding: 10px 16px 12px; display: flex; flex-direction: column; gap: 8px; }
+.bar { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px;
+       display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.bar label { display: flex; align-items: center; gap: 4px; color: var(--muted); }
+.bar .sep { width: 1px; align-self: stretch; background: var(--line); margin: 0 4px; }
+.bar .grow { flex: 1; }
+input[type=number] { width: 56px; }
+
+.progress { display: flex; align-items: center; gap: 12px; }
+.track { flex: 1; height: 8px; background: var(--hover); border-radius: 4px; overflow: hidden; min-width: 120px; }
+.fill { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+.fill.done-ok { background: var(--ok); } .fill.done-bad { background: var(--bad); }
+.counts { display: flex; gap: 6px; }
+#jobText { white-space: nowrap; font-weight: 600; }
+#jobText.idle { color: var(--muted); font-weight: 400; }
+
+.log { display: none; height: 220px; flex-direction: column; background: #1d2125; color: #c7d1db;
+       border-radius: 6px; overflow: hidden; }
+.log.open { display: flex; }
+.log .lhead { display: flex; align-items: center; gap: 8px; padding: 4px 10px; background: #22272b; color: #9fadbc; }
+.log .lhead button { background: transparent; color: #9fadbc; border-color: #454f59; padding: 1px 8px; }
+.log pre { flex: 1; margin: 0; padding: 6px 10px; overflow: auto; font: 12px/1.45 var(--mono); white-space: pre-wrap; word-break: break-all; }
+.log .ok { color: #7ee2b8; } .log .bad { color: #fd9891; } .log .cmd { color: #85b8ff; }
+
+.panel-desc { color: var(--muted); font-size: 12px; }
+.modal-bg { position: fixed; inset: 0; background: rgba(9,30,66,.45); display: none; align-items: center;
+            justify-content: center; z-index: 20; }
+.modal-bg.open { display: flex; }
+.modal { background: var(--panel); border-radius: 8px; width: 520px; max-width: calc(100vw - 32px); padding: 18px 20px;
+         box-shadow: 0 8px 28px rgba(9,30,66,.3); }
+.modal h2 { font-size: 16px; margin: 0 0 12px; }
+.choice { display: block; width: 100%; text-align: left; padding: 10px 12px; margin-bottom: 8px; white-space: normal; }
+.choice b { display: block; margin-bottom: 2px; }
+.choice span { color: var(--muted); font-size: 12px; }
+.choice.danger b { color: var(--bad); }
+.modal .foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.ask-body { white-space: pre-wrap; line-height: 1.6; max-height: 50vh; overflow: auto; }
+.ask-body .warn { color: var(--bad); font-weight: 600; }
+.ask-extra { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+.ask-extra input[type=text] { width: 100%; border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; }
+.ask-extra label { display: flex; gap: 6px; align-items: flex-start; }
+button.primary.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
+.toast { position: fixed; right: 16px; top: 52px; background: #172b4d; color: #fff; padding: 8px 14px;
+         border-radius: 6px; opacity: 0; transition: opacity .2s; pointer-events: none; max-width: 420px; z-index: 10; }
+.toast.show { opacity: .95; } .toast.err { background: var(--bad); }
+/* 줄맞춤: 세 칸의 제목·검색·트리 시작 높이를 맞춤. 요약 숫자와 설명은 칸 맨 아래 */
+.panel-head .title { flex-wrap: nowrap; align-items: center; height: 26px; }
+.panel-head .title .tools { flex-shrink: 0; }
+.panel-head .row { align-items: stretch; }
+.panel-head .row input[type=search] { flex: 1 1 auto; min-width: 80px; width: auto; }
+.panel-head .row select { flex: 0 1 auto; min-width: 0; }
+.panel-head .row .fold { display: flex; gap: 2px; flex-shrink: 0; }
+.panel-head .row .fold button { height: auto; min-width: 28px; padding: 0 6px; font-size: 15px; line-height: 1; }
+.panel-foot { padding: 6px 10px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; line-height: 1.4em; }
+.panel-foot .sum { color: var(--text, inherit); font-weight: 600; }
+.panel-foot .sum:not(:empty)::after { content: ' — '; font-weight: 400; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Hive 이관</h1>
+  <div class="meta">
+    <span id="invInfo">인벤토리: -</span>
+    <span id="cfgInfo"></span>
+  </div>
+</header>
+
+<main>
+  <section class="panel">
+    <div class="panel-head">
+      <div class="title"><b>원본 (SOURCE)</b></div>
+      <div class="row">
+        <span class="fold"><button class="small" id="btnExpandSrc" title="모든 DB 펼치기">⊞</button><button class="small" id="btnCollapseSrc" title="모든 DB 접기">⊟</button></span><input type="search" id="srcSearch" placeholder="db.table 검색">
+        <select id="srcKind" title="종류">
+          <option value="">전체 종류</option><option>EXTERNAL</option><option>MANAGED</option>
+          <option>ACID</option><option>VIEW</option>
+        </select>
+        <select id="srcState" title="이관 상태">
+          <option value="">전체</option><option value="todo">이관 안 됨</option><option value="bad">실패</option>
+        </select>
+      </div>
+    </div>
+    <div class="tree" id="srcTree"></div>
+    <div class="panel-foot"><span class="sum" id="srcSub"></span>원본 클러스터의 DB·테이블입니다. 체크한 뒤 [목록에 추가 ▶]로 이관 목록에 넣습니다.</div>
+  </section>
+
+  <div class="mid">
+    <button id="btnAdd" title="왼쪽 원본에서 체크한 테이블을 [이관 목록]에 넣습니다">목록에 추가 ▶</button>
+    <button id="btnRemove" title="[이관 목록]에서 체크한 테이블을 뺍니다 (대상 클러스터는 바뀌지 않음)">◀ 목록에서 제외</button>
+    <div class="hint" id="pickHint"></div>
+  </div>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div class="title"><b>이관 목록</b>
+        <span class="tools">
+          <button class="small" id="btnImport" title="sources.csv 파일을 읽어 이관 목록에 추가">불러오기</button>
+          <button class="small" id="btnExport" title="이관 목록을 sources.csv 형식으로 저장">저장</button>
+          <button class="small" id="btnClear" title="이관 목록을 모두 비움 (대상 클러스터는 바뀌지 않음)">비우기</button>
+        </span></div>
+      <div class="row"><span class="fold"><button class="small" id="btnExpandList" title="모든 DB 펼치기">⊞</button><button class="small" id="btnCollapseList" title="모든 DB 접기">⊟</button></span><input type="search" id="listSearch" placeholder="db.table 검색"></div>
+    </div>
+    <div class="tree" id="listTree"></div>
+    <div class="panel-foot"><span class="sum" id="cntList"></span>[목록 이관 실행]으로 옮길 테이블. 성공하면 오른쪽 [이관 결과]로 이동합니다.</div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div class="title"><b>이관 결과</b>
+        <span class="tools">
+          <button class="small" id="btnRetry" title="마지막 시도가 실패/불일치/중지인 원본 테이블을 이관 목록에 추가 (결과 칸에 안 나오는 실패 포함)">◀ 실패 건 목록에 추가</button>
+          <button class="small" id="btnTgtRefresh" title="대상 클러스터의 DB 목록을 다시 조회">↻</button>
+          <button class="small danger" id="btnDropTarget" title="체크한 테이블을 대상 클러스터에서 삭제(DROP)합니다. external 테이블은 복사된 파일도 지웁니다. 원본은 건드리지 않습니다">선택 삭제</button>
+        </span></div>
+      <div class="row">
+        <span class="fold"><button class="small" id="btnExpandResult" title="모든 DB 펼치기">⊞</button><button class="small" id="btnCollapseResult" title="모든 DB 접기">⊟</button></span><input type="search" id="resultSearch" placeholder="db.table 검색">
+        <select id="resultState">
+          <option value="">전체</option><option value="ok">성공</option>
+          <option value="bad">불일치 (검증 실패)</option>
+        </select>
+      </div>
+    </div>
+    <div class="tree" id="resultTree"></div>
+    <div class="panel-foot"><span class="sum" id="cntResult"></span>대상 클러스터에 지금 있는 테이블입니다(실제 목록 기준). 상태·행 수는 이 도구의 기록에서 붙입니다. 테이블이 만들어지지 않은 실패는 이관 목록과 원본 트리(상태 필터: 실패)에서 봅니다.</div>
+  </section>
+</main>
+
+<footer>
+  <div class="bar">
+    <label>대상에 이미 있으면
+      <select id="optIfExists" title="기본: 대상 테이블을 지우고(DROP) 원본에서 다시 만듭니다"><option value="replace">지우고 다시 만듦</option>
+        <option value="skip">건너뜀</option><option value="fail">실패 처리</option></select></label>
+    <label>검증
+      <select id="optValidate" title="행 수 + 해시: 원본과 대상 모두 전체 데이터를 읽어 내용까지 비교 (기본)"><option value="checksum">행 수 + 해시</option><option value="count">행 수</option><option value="none">안 함</option></select></label>
+    <label title="테이블·뷰를 동시에 몇 개 처리할지. 이관 실행 중에 바꾸면 몇 초 안에 반영됩니다 (줄이면 진행 중인 테이블은 끝까지 둠)">동시 처리 <input type="number" id="optParallel" min="1" max="64" value="2"></label>
+    <label title="파티션 테이블의 원본 행 수가 0이면, HDFS에만 있고 원본 메타스토어에 없는 파티션을 원본에서 MSCK REPAIR로 등록한 뒤 다시 셉니다"><input type="checkbox" id="optRepair" checked> 원본 0행이면 MSCK 복구</label>
+    <span class="grow"></span>
+    <button id="btnDry" title="실제로 옮기지 않고, 대상에 만들 DDL과 처리 방식만 확인">Dry-run</button>
+    <button id="btnRun" class="primary">목록 이관 실행</button>
+    <button id="btnStop" class="danger">중지</button>
+  </div>
+  <div class="bar">
+    <button id="btnInventory" title="원본을 조회해서 인벤토리를 새로 만듦 (원본 읽기 전용)">인벤토리 새로고침</button>
+    <span class="sep"></span>
+    <input type="file" id="fileImport" accept=".csv,text/csv" hidden>
+    <span class="sep"></span>
+    <div class="progress grow">
+      <span id="jobText">대기 중</span>
+      <div class="track" id="progressTrack"><div class="fill" id="fill"></div></div>
+      <span class="counts" id="counts"></span>
+    </div>
+    <button id="btnLog">로그 ▴</button>
+  </div>
+  <div class="log" id="log">
+    <div class="lhead"><span id="logTitle">로그</span><span class="grow" style="flex:1"></span>
+      <button id="btnLogAll" hidden>전체 로그 보기</button>
+      <label><input type="checkbox" id="logFollow" checked> 자동 스크롤</label></div>
+    <pre id="logBody"></pre>
+  </div>
+</footer>
+<div class="toast" id="toast"></div>
+<div class="modal-bg" id="askModal">
+  <div class="modal" role="dialog" aria-modal="true">
+    <h2 id="askTitle"></h2>
+    <div class="ask-body" id="askBody"></div>
+    <div class="ask-extra" id="askExtra"></div>
+    <div class="foot"><button id="askCancel">취소</button><button id="askOk" class="primary">확인</button></div>
+  </div>
+</div>
+<div class="modal-bg" id="stopModal">
+  <div class="modal">
+    <h2>작업 중지</h2>
+    <button class="choice" id="stopGraceful"><b>진행 중인 테이블만 끝내고 중지</b>
+      <span>새 테이블은 시작하지 않습니다. 지금 처리 중인 테이블은 끝까지 이관하고 검증합니다. 결과는 정상적으로 기록됩니다.</span></button>
+    <button class="choice" id="stopNow"><b>즉시 중지</b>
+      <span>처리 중인 명령(beeline, distcp)을 끊고 YARN에 올라간 distcp 작업도 종료합니다.
+        처리 중이던 테이블은 대상에서 되돌리고(테이블·복사된 파일 삭제) '중지'로 기록합니다.</span></button>
+    <button class="choice danger" id="stopForce"><b>강제 종료</b>
+      <span>즉시 중지가 응답하지 않을 때만 사용하세요. 되돌리기와 결과 기록 없이 바로 끝냅니다.
+        만들다 만 대상 테이블이 남을 수 있어 다시 실행할 때 '지우고 다시 만듦'이 필요합니다.</span></button>
+    <div class="foot"><button id="stopCancel">취소</button></div>
+  </div>
+</div>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const S = {
+  dbs: [], tables: {}, info: {},         // 인벤토리
+  open: new Set(), picked: new Set(),     // 왼쪽 펼침 / 체크
+  queue: [], tgtPicked: new Set(), resPicked: new Set(), resDbPicked: new Set(), tgtOpen: new Set(), paneDbs: {},
+  tgtDbs: null, tgtDbsErr: null,
+  dbMap: {},        // 이관 목록의 대상 DB 이름 바꾸기 {원본 db: 대상 db} (DB 단위, 테이블 이름은 그대로)
+  srcHist: {},      // 원본 이름 기준 마지막 결과 (S.history는 대상 이름 기준)   // 대상 클러스터의 실제 DB 목록 (테이블이 없는 DB도 표시)
+  history: {}, job: null, logOffset: 0, logLines: [], logFilter: null,
+  searchRows: null, wasRunning: false, tab: 'list',
+};
+const BAD = new Set(['MISMATCH', 'FAILED', 'STOPPED', 'NOT RUN', 'UNSUPPORTED']);
+const LABEL = { OK: 'OK', MISMATCH: '불일치', FAILED: '실패', RUNNING: '진행중', PENDING: '메타 조회 대기', READY: '이관 차례 대기', NOREC: '도구 기록 없음', WAIT: '이관 대기', DROPPED: '삭제됨', DELQ: '삭제 대기', DELETING: '삭제 중',
+  QUEUED: '실행 전', SKIPPED: '건너뜀', 'DRY-RUN': 'Dry-run', STOPPED: '중지됨', 'NOT RUN': '미실행' };
+
+// ------------------------------------------------------------------ util
+function h(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === 'class') e.className = v;
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+    else if (k === 'checked' || k === 'disabled' || k === 'indeterminate') e[k] = v;
+    else e.setAttribute(k, v);
+  }
+  for (const c of kids.flat()) if (c !== null && c !== undefined && c !== false)
+    e.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  return e;
+}
+function size(b) {
+  if (b === null || b === undefined) return '';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']; let i = 0, v = b;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i ? v.toFixed(v < 10 ? 1 : 0) : v) + u[i];
+}
+function toast(msg, err) {
+  const t = $('toast'); t.textContent = msg; t.className = 'toast show' + (err ? ' err' : '');
+  clearTimeout(toast.t);   // 긴 안내는 더 오래 보여줌 (글자당 80ms, 최소 2.5초 / 오류 5초)
+  toast.t = setTimeout(() => t.className = 'toast', Math.max(err ? 5000 : 2500, msg.length * 80));
+}
+// 화면 안 확인 창 (브라우저 기본 confirm/prompt는 VS Code 내장 브라우저 등에서 동작하지 않음)
+//   ask({ title, body, ok, danger, typeWord, checks: [{id, label, checked}] }) -> null(취소) | { checks: {id: bool} }
+function ask(o) {
+  return new Promise(resolve => {
+    const m = $('askModal'), okBtn = $('askOk'), extra = $('askExtra');
+    $('askTitle').textContent = o.title;
+    $('askBody').replaceChildren(...[].concat(o.body).map(x => x instanceof Node ? x : document.createTextNode(x)));
+    extra.replaceChildren();
+    const checks = (o.checks || []).map(c => {
+      const cb = h('input', { type: 'checkbox', checked: !!c.checked });
+      extra.append(h('label', {}, cb, h('span', {}, c.label)));
+      return [c.id, cb];
+    });
+    let input = null, text = null;
+    if (o.text) {
+      text = h('input', { type: 'text', placeholder: o.text.placeholder || '', autocomplete: 'off' });
+      text.value = o.text.value || '';
+      extra.append(text);
+    }
+    if (o.typeWord) {
+      input = h('input', { type: 'text', placeholder: `계속하려면 "${o.typeWord}"를 입력하세요`, autocomplete: 'off' });
+      extra.append(input);
+    }
+    okBtn.textContent = o.ok || '확인';
+    okBtn.className = 'primary' + (o.danger ? ' danger' : '');
+    const sync = () => { okBtn.disabled = !!input && input.value.trim() !== o.typeWord; };
+    if (input) input.oninput = sync;
+    sync();
+    const close = val => { m.classList.remove('open'); document.removeEventListener('keydown', onKey); resolve(val); };
+    const onOk = () => { if (!okBtn.disabled) close({ checks: Object.fromEntries(checks.map(([id, cb]) => [id, cb.checked])),
+                                                      text: text ? text.value.trim() : null }); };
+    const onKey = e => { if (e.key === 'Escape') close(null);
+                         if (e.key === 'Enter' && !e.isComposing) onOk(); };   // 한글 입력 조합 중 Enter는 무시
+    okBtn.onclick = onOk; $('askCancel').onclick = () => close(null);
+    m.onclick = e => { if (e.target === m) close(null); };
+    document.addEventListener('keydown', onKey);
+    m.classList.add('open');
+    (input || text || okBtn).focus();
+    if (text) text.select();
+  });
+}
+async function api(path, body) {
+  const opt = body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                          body: JSON.stringify(body) };
+  const r = await fetch(path, opt);
+  const j = await r.json().catch(() => ({ error: r.statusText }));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+const key = (db, t) => db + '.' + t;
+// 'db.table' 목록 -> "DB n개, Table m개"
+function dbTblText(keys) {
+  const dbs = new Set(); let n = 0;
+  for (const k of keys) { dbs.add(k.slice(0, k.indexOf('.'))); n++; }
+  return `DB ${dbs.size.toLocaleString()}개, Table ${n.toLocaleString()}개`;
+}
+const split = k => { const i = k.indexOf('.'); return [k.slice(0, i), k.slice(i + 1)]; };
+const selectable = t => !t.error && t.kind !== 'UNSUPPORTED' && t.kind !== 'ERROR';
+function saveQueue() {
+  const dbs = new Set(S.queue.map(k => split(k)[0]));
+  for (const db of Object.keys(S.dbMap)) if (!dbs.has(db) || S.dbMap[db] === db) delete S.dbMap[db];   // 목록에 없는 DB의 이름 바꾸기는 정리
+  try { localStorage.setItem('hm.queue', JSON.stringify(S.queue)); localStorage.setItem('hm.dbmap', JSON.stringify(S.dbMap)); } catch (e) {}
+}
+function loadQueue() {
+  try { S.queue = JSON.parse(localStorage.getItem('hm.queue') || '[]'); } catch (e) { S.queue = []; }
+  try { S.dbMap = JSON.parse(localStorage.getItem('hm.dbmap') || '{}'); } catch (e) { S.dbMap = {}; }
+}
+const tgtDbOf = db => S.dbMap[db] || db;
+const HELP = {
+  PENDING: '1단계(준비): 이관 전에 목록 전체의 원본 메타데이터(DDL, 종류, 파티션)를 조회합니다. 이 테이블은 아직 조회 전입니다.',
+  READY: '메타데이터 조회 완료. 2단계에서는 병렬 설정 수만큼만 동시에 이관하므로, 앞 테이블이 끝나 자리가 나기를 기다립니다.',
+  RUNNING: '이관 중입니다. 클릭하면 이 테이블 로그를 볼 수 있습니다.',
+  QUEUED: '이관 목록에 들어 있고 아직 실행하지 않았습니다.',
+  NOREC: '대상 클러스터에 있지만 이 도구로 옮긴 기록이 없는 테이블입니다 (직접 만들었거나 다른 곳에서 옮김).',
+  WAIT: '지금 실행 중인 이관에 들어 있고 아직 차례가 오지 않았습니다. 차례가 되면 지우고 다시 만들기 때문에 지난 결과(OK·행 수)는 표시하지 않습니다.',
+};
+function stBadge(st) { return h('span', { class: 'st ' + st.split(' ')[0], title: HELP[st] || null }, LABEL[st] || st); }
+
+// ------------------------------------------------------------------ 데이터
+async function loadInfo() {
+  S.info = await api('/api/info');
+  const inv = S.info.inventory;
+  $('invInfo').textContent = inv.file
+    ? `인벤토리: ${inv.time} · DB ${inv.dbs}개 · 테이블 ${inv.tables.toLocaleString()}개`
+    : '인벤토리 없음 — [인벤토리 새로고침]을 먼저 실행하세요';
+  $('cfgInfo').textContent = '설정: ' + S.info.config;
+}
+async function loadSource() {
+  S.dbs = await api('/api/source/dbs'); S.tables = {};
+  await Promise.all([...S.open].map(db => ensureTables(db)));
+  renderSource();
+}
+async function ensureTables(db) {
+  if (!S.tables[db]) S.tables[db] = await api('/api/source/tables?db=' + encodeURIComponent(db));
+  return S.tables[db];
+}
+async function loadHistory() {
+  // target: 대상에 지금 있는 테이블(이관 결과 칸) / attempts: 원본별 마지막 시도(실패 포함)
+  const r = await api('/api/history');
+  S.history = r.target || {}; S.srcHist = r.attempts || {};
+}
+async function loadTargetDbs(refresh) {   // 대상 클러스터 실제 DB·테이블 목록 (beeline 조회라 몇 초 걸림)
+  S.tgtLoadedAt = Date.now();
+  try { const r = await api('/api/target/dbs' + (refresh ? '?refresh=1' : ''));
+        S.tgtDbs = r.dbs; S.tgtTables = r.tables || null; S.tgtAt = r.at; S.tgtDbsErr = r.error; }
+  catch (e) { S.tgtDbsErr = e.message; }
+  renderResult();
+}
+
+// ------------------------------------------------------------------ 왼쪽 (원본)
+function srcFilter(db, t) {
+  const kind = $('srcKind').value, st = $('srcState').value, k = key(db, t.table);
+  if (kind && t.kind !== kind) return false;
+  const hs = srcShownStatus(k);
+  if (st === 'todo' && hs === 'OK') return false;
+  if (st === 'bad' && !BAD.has(hs)) return false;
+  return true;
+}
+function tableNode(db, t) {
+  const k = key(db, t.table), ok = selectable(t), shown = srcShownStatus(k);
+  return h('div', { class: 'node tbl' + (ok ? '' : ' disabled') + (S.picked.has(k) ? ' picked' : ''),
+                    title: t.error || t.location || '' },
+    h('input', { type: 'checkbox', checked: S.picked.has(k), disabled: !ok,
+                 onchange: e => { e.target.checked ? S.picked.add(k) : S.picked.delete(k); renderSource(); } }),
+    h('span', { class: 'name' }, t.table),
+    S.queue.includes(k) ? h('span', { class: 'mark', title: '이관 목록에 들어 있음' }, '목록에 있음') : null,
+    shown ? stBadge(shown) : null,
+    t.kind === 'ACID' ? h('span', { title: 'ACID: 파일 복사 대신 INSERT…SELECT로 이관 (원본에 임시 테이블 생성)' }, '⚠') : null,
+    h('span', { class: 'badge ' + t.kind }, t.kind === 'EXTERNAL' ? 'EXT' : t.kind === 'MANAGED' ? 'MNG' : t.kind),
+    h('span', { class: 'num', title: t.partitioned ? `파티션 ${t.partition_count ?? '?'}개` : '' },
+      t.partitioned ? `파티션 ${t.partition_count ?? '?'}` : ''),
+    h('span', { class: 'num' }, size(t.size_bytes)));
+}
+function dbNode(db, nTables, bytes, rows, forceOpen) {
+  const open = forceOpen || S.open.has(db);
+  const sel = rows ? rows.filter(t => selectable(t) && srcFilter(db, t)) : [];
+  const nPicked = sel.filter(t => S.picked.has(key(db, t.table))).length;
+  const all = !!rows && nPicked > 0 && nPicked === sel.length;
+  // 펼치기/접기는 ▶ 화살표만. DB 이름 클릭 = 체크 토글 (여러 DB를 연달아 고를 수 있게)
+  return h('div', { class: 'node db' },
+    h('span', { class: 'caret', title: '펼치기/접기', onclick: () => toggleDb(db) }, open ? '▼' : '▶'),
+    h('input', { type: 'checkbox', checked: all,
+                 indeterminate: nPicked > 0 && nPicked < sel.length,
+                 onchange: e => pickDb(db, e.target.checked) }),
+    h('span', { class: 'name clickable', title: '클릭: DB 전체 선택/해제', onclick: () => pickDb(db, !all) }, db),
+    h('span', { class: 'num' }, nTables + '개'),
+    h('span', { class: 'num' }, size(bytes)));
+}
+function renderSource() {
+  const tree = $('srcTree'); const frag = document.createDocumentFragment();
+  if (!S.info.inventory || !S.info.inventory.file) {
+    tree.replaceChildren(h('div', { class: 'empty' }, '인벤토리가 없습니다. 아래 [인벤토리 새로고침]을 누르세요.'));
+    return;
+  }
+  const filtering = $('srcKind').value || $('srcState').value;
+  if (S.searchRows) {   // 검색 결과: DB별로 펼쳐서 표시
+    const by = {};
+    for (const t of S.searchRows.rows) if (srcFilter(t.db, t)) (by[t.db] = by[t.db] || []).push(t);
+    for (const db of Object.keys(by)) {
+      frag.append(dbNode(db, by[db].length, by[db].reduce((a, t) => a + (t.size_bytes || 0), 0), by[db], true));
+      for (const t of by[db]) frag.append(tableNode(db, t));
+    }
+    if (!Object.keys(by).length) frag.append(h('div', { class: 'empty' }, '검색 결과 없음'));
+    if (S.searchRows.more) frag.append(h('div', { class: 'empty' }, '결과가 많아 1,000개까지만 표시합니다'));
+  } else {
+    for (const d of S.dbs) {
+      const rows = S.tables[d.db];
+      frag.append(dbNode(d.db, d.tables, d.size_bytes, rows, false));
+      if (S.open.has(d.db) && rows) for (const t of rows) if (srcFilter(d.db, t)) frag.append(tableNode(d.db, t));
+    }
+    if (filtering) frag.append(h('div', { class: 'empty' }, '종류/상태 필터는 펼친 DB에 적용됩니다'));
+  }
+  const top = tree.scrollTop; tree.replaceChildren(frag); tree.scrollTop = top;
+  $('srcSub').textContent = S.picked.size ? `선택: ${dbTblText(S.picked)}` : '';
+  $('pickHint').textContent = S.picked.size ? `${dbTblText(S.picked)} 선택됨` : '';
+}
+async function toggleDb(db) {
+  if (S.searchRows) return;
+  if (S.open.has(db)) S.open.delete(db); else { S.open.add(db); await ensureTables(db); }
+  renderSource();
+}
+async function pickDb(db, on) {
+  const rows = S.searchRows ? S.searchRows.rows.filter(t => t.db === db) : await ensureTables(db);
+  for (const t of rows) if (selectable(t) && srcFilter(db, t)) {
+    const k = key(db, t.table); on ? S.picked.add(k) : S.picked.delete(k);
+  }
+  renderSource();
+}
+let searchTimer;
+$('srcSearch').addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(async () => {
+    const q = $('srcSearch').value.trim();
+    S.searchRows = q ? await api('/api/source/search?q=' + encodeURIComponent(q)) : null;
+    renderSource();
+  }, 250);
+});
+$('srcKind').onchange = $('srcState').onchange = renderSource;
+
+// ------------------------------------------------------------------ 오른쪽 (대상): [이관 목록] / [이관 결과]
+//  이관 목록 = 다음에 [목록 이관 실행]을 누르면 옮길 테이블. 실행 중에는 실시간 상태를 보여주고,
+//              끝나면 OK/건너뜀은 목록에서 빠져 [이관 결과]로 가고 실패는 목록에 남는다.
+//  이관 결과 = 지금까지 실행한 결과(reports/migration_*.csv)의 테이블별 최신 상태.
+// 실행 중인 이관의 실시간 상태를 대상 이름 기준으로 (결과 기록 파일은 1분마다·끝날 때 다시 읽음)
+//   OK/MISMATCH: 방금 끝남 -> 바로 결과 칸에 표시 / RUNNING: 대상 테이블을 만드는 중 -> 결과 칸에서 숨김
+//   WAIT: 이번 실행에서 아직 차례가 안 옴 -> 지난 결과(OK·행 수)는 지우고 '이관 대기'로만 표시
+function liveTargets() {
+  const j = S.job, live = {};
+  if (!(j && j.running && j.kind === 'migrate' && j.items)) return live;
+  for (const [sk, st] of Object.entries(j.items)) {
+    const v = st === 'PENDING' || st === 'READY' ? 'WAIT' : st;
+    if (v !== 'OK' && v !== 'MISMATCH' && v !== 'RUNNING' && v !== 'WAIT') continue;
+    const [sdb, t] = split(sk); live[key(tgtDbOf(sdb), t)] = v;
+  }
+  return live;
+}
+// 이번 실행에서 방금 끝났지만 행 수가 담긴 결과 기록을 아직 다시 읽지 않은 테이블
+function countPending(k) {
+  const j = S.job, l = liveTargets()[k];
+  if (l !== 'OK' && l !== 'MISMATCH') return false;
+  const hs = S.history[k];
+  return !hs || (j.run_id && hs.run_id !== j.run_id);
+}
+function resultStatus(k, live) {   // 대상 이름 기준
+  const l = (live || liveTargets())[k];
+  if (l === 'OK' || l === 'MISMATCH' || l === 'WAIT') return l;
+  return S.history[k] ? S.history[k].status : 'NOREC';   // 대상에 있지만 이 도구로 옮긴 기록이 없음
+}
+function srcStatus(k) { return S.srcHist[k] ? S.srcHist[k].status : null; }           // 원본 이름 기준 (지난 결과)
+// 원본 트리에 보일 상태: 이관이 돌고 있고 이번 실행에 들어간 테이블이면 지난 결과는 지우고 이번 실행 상태만
+//   (메타 조회 대기·이관 차례 대기 = 표시 없음, 진행중·완료 = 이번 실행 결과)
+function srcShownStatus(k) {
+  const j = S.job;
+  if (j && j.running && j.kind === 'migrate' && j.items && k in j.items) {
+    const st = j.items[k];
+    return st === 'PENDING' || st === 'READY' ? null : st;
+  }
+  const st = srcStatus(k);
+  return st === 'DROPPED' ? null : st;   // 대상에서 지운 기록은 원본에 표시하지 않음 (원본이 삭제된 것으로 오해)
+}
+const srcOfResult = k => (S.history[k] && S.history[k].src) || k;
+function listStatus(k) {
+  const j = S.job;
+  if (j && j.running && j.kind !== 'drop' && j.items && k in j.items) return j.items[k];   // 실행 중이면 실시간 상태
+  return 'QUEUED';
+}
+function groupByDb(keys) {
+  const by = {};
+  for (const k of keys) { const [db] = split(k); (by[db] = by[db] || []).push(k); }
+  for (const db in by) by[db].sort();
+  return by;
+}
+function tgtDbNode(pane, db, ks, statusOf, picked) {   // picked: 체크박스용 Set (없으면 체크박스 없음)
+  (S.paneDbs[pane] = S.paneDbs[pane] || []).push(db);
+  const cnt = {};
+  for (const k of ks) { const s = statusOf(k); cnt[s] = (cnt[s] || 0) + 1; }
+  const nP = picked ? ks.filter(k => picked.has(k)).length : 0;
+  const open = !S.tgtOpen.has(pane + ':' + db);   // 기본은 펼침, 접은 것만 기억
+  return [open, h('div', { class: 'node db' },
+    h('span', { class: 'caret', onclick: () => { const id = pane + ':' + db;
+      S.tgtOpen.has(id) ? S.tgtOpen.delete(id) : S.tgtOpen.add(id); renderTarget(); } }, open ? '▼' : '▶'),
+    picked ? h('input', { type: 'checkbox', checked: nP > 0 && nP === ks.length, indeterminate: nP > 0 && nP < ks.length,
+      title: pane === 'result' ? 'DB의 결과 전체 선택' : null,
+      onchange: e => { for (const k of ks) e.target.checked ? picked.add(k) : picked.delete(k); renderTarget(); } }) : null,
+    h('span', { class: 'name' }, db),
+    h('span', { class: 'dbsum' }, Object.entries(cnt).map(([s, n]) =>
+      h('span', { class: 'st ' + s.split(' ')[0] }, `${LABEL[s] || s} ${n}`))))];
+}
+function rowsText(k) {
+  const hs = S.history[k];
+  if (!hs || hs.src_rows === '') return null;
+  const f = v => v === '' ? '-' : Number(v).toLocaleString();
+  return h('span', { class: 'num', title: '원본 행 수 / 대상 행 수' }, `${f(hs.src_rows)} / ${f(hs.tgt_rows)}`);
+}
+function dropState(k) {   // 대상 삭제 작업이 도는 중이면 그 테이블의 삭제 상태
+  const j = S.job;
+  if (!(j && j.running && j.kind === 'drop' && j.items && k in j.items)) return null;
+  const st = j.items[k];
+  return st === 'PENDING' ? 'DELQ' : st === 'RUNNING' ? 'DELETING' : st;
+}
+function resultKeySet() {
+  // 기준은 대상 클러스터의 실제 테이블 목록. (아직 못 읽었으면 도구 기록으로 임시 표시)
+  const live = liveTargets();
+  if (S.tgtTables) {
+    const keys = new Set();
+    for (const [db, ts] of Object.entries(S.tgtTables)) for (const t of ts) keys.add(key(db, t));
+    for (const [k, st] of Object.entries(live)) {
+      if (st === 'RUNNING') keys.delete(k); else if (st !== 'WAIT') keys.add(k);   // WAIT: 대상에 있는 것만 그대로
+    }   // 진행 중은 숨김, 방금 끝난 건 바로
+    return keys;
+  }
+  return new Set(Object.keys(S.history));
+}
+function renderTarget() { renderList(); renderResult(); }
+function renderList() {
+  S.paneDbs.list = [];
+  const q = $('listSearch').value.trim().toLowerCase(), frag = document.createDocumentFragment();
+  $('cntList').textContent = S.queue.length ? dbTblText(S.queue) + (S.tgtPicked.size ? ` · 선택: ${dbTblText(S.tgtPicked)}` : '') : '';
+  const by = groupByDb(S.queue.filter(k => !q || k.toLowerCase().includes(q)));
+  for (const db of Object.keys(by).sort()) {
+    const [open, node] = tgtDbNode('list', db, by[db], listStatus, S.tgtPicked); frag.append(node);
+    const nameEl = node.querySelector('.name'), tdb = tgtDbOf(db);
+    nameEl.replaceChildren(db, tdb !== db ? h('span', { class: 'rename', title: '대상 클러스터에서 쓸 DB 이름' }, ' → ' + tdb) : '');
+    nameEl.after(h('button', { class: 'small icon', title: '대상 DB 이름 바꾸기 (이 DB의 모든 테이블에 적용, 테이블 이름은 그대로)',
+                               onclick: () => renameDb(db) }, '✎'));
+    if (!open) continue;
+    for (const k of by[db]) {
+      const st = listStatus(k), prev = srcStatus(k), [, t] = split(k);
+      frag.append(h('div', { class: 'node tbl clickable' + (S.tgtPicked.has(k) || S.logFilter === k ? ' picked' : ''),
+                             title: '클릭: 이 테이블 로그만 보기', onclick: e => { if (e.target.tagName !== 'INPUT') showLogFor(k); } },
+        h('input', { type: 'checkbox', checked: S.tgtPicked.has(k),
+                     onchange: e => { e.target.checked ? S.tgtPicked.add(k) : S.tgtPicked.delete(k); renderList(); } }),
+        h('span', { class: 'name' }, t),
+        st === 'QUEUED' && prev ? h('span', { class: 'num', title: '지난 이관 결과' }, '지난 ' + (LABEL[prev] || prev)) : null,
+        stBadge(st)));
+    }
+  }
+  if (!S.queue.length) frag.append(h('div', { class: 'empty' }, '비어 있습니다.', h('br'),
+    '왼쪽 원본에서 테이블을 체크하고', h('br'), '[목록에 추가 ▶]를 누르세요.'));
+  else if (!Object.keys(by).length) frag.append(h('div', { class: 'empty' }, '검색 결과 없음'));
+  const tree = $('listTree'), top = tree.scrollTop; tree.replaceChildren(frag); tree.scrollTop = top;
+}
+function renderResult() {
+  S.paneDbs.result = [];
+  const q = $('resultSearch').value.trim().toLowerCase(), f = $('resultState').value;
+  const all = resultKeySet(), frag = document.createDocumentFragment();
+  const nBad = [...all].filter(k => BAD.has(resultStatus(k))).length;
+  const nDb = new Set([...(S.tgtDbs || []), ...[...all].map(k => split(k)[0])]).size;   // 빈 DB 포함
+  $('cntResult').textContent = [`DB ${nDb.toLocaleString()}개, Table ${all.size.toLocaleString()}개`,
+    nBad ? `불일치 ${nBad}` : '', S.tgtAt ? `대상 기준 ${S.tgtAt}` : '대상 확인 중…'].filter(Boolean).join(' · ');
+  $('btnRetry').disabled = !Object.keys(S.srcHist).some(k => BAD.has(srcStatus(k)) && srcStatus(k) !== 'UNSUPPORTED');
+  for (const k of [...S.resPicked]) if (!all.has(k)) S.resPicked.delete(k);
+  for (const db of [...S.resDbPicked]) if (!(S.tgtDbs || []).includes(db)) S.resDbPicked.delete(db);
+  const nPick = S.resPicked.size + S.resDbPicked.size;
+  $('btnDropTarget').disabled = !nPick || !!(S.job && S.job.running);
+  $('btnDropTarget').textContent = nPick ? `선택 삭제 (${nPick})` : '선택 삭제';
+  const keys = [...all].filter(k => (!q || k.toLowerCase().includes(q)) &&
+    (!f || (f === 'ok' ? resultStatus(k) === 'OK' : BAD.has(resultStatus(k)))));
+  const by = groupByDb(keys);
+  // 이번 실행에서 방금 만든 DB는 대상 목록을 다시 읽기 전이라도 있는 것으로 봄
+  const tdb = new Set([...(S.tgtDbs || []), ...Object.keys(liveTargets()).map(k => split(k)[0])]);
+  // 대상에 있지만 이관 결과가 없는 DB (빈 DB 등): 상태 필터가 없을 때만, 검색어는 DB 이름에 적용
+  const emptyDbs = f ? [] : [...tdb].filter(db => !(db in by) && (!q || db.toLowerCase().includes(q)));
+  for (const db of [...Object.keys(by), ...emptyDbs].sort()) {
+    if (!(db in by)) {
+      const canDrop = db.toLowerCase() !== 'default';
+      frag.append(h('div', { class: 'node db' + (S.resDbPicked.has(db) ? ' picked' : '') },
+        h('span', { class: 'caret' }, ''),
+        h('input', { type: 'checkbox', checked: S.resDbPicked.has(db), disabled: !canDrop,
+                     title: canDrop ? 'DB 선택 (삭제)' : 'default DB는 삭제할 수 없습니다',
+                     onchange: e => { e.target.checked ? S.resDbPicked.add(db) : S.resDbPicked.delete(db); renderResult(); } }),
+        h('span', { class: 'name' }, db),
+        h('span', { class: 'st EMPTY', title: S.tgtTables ? '대상 클러스터에 DB는 있지만 테이블이 없습니다.' : '대상 클러스터에 DB는 있지만 이관 결과가 없습니다.' }, S.tgtTables ? '빈 DB' : '이관 결과 없음')));
+      continue;
+    }
+    const [open, node] = tgtDbNode('result', db, by[db], k => dropState(k) || resultStatus(k), S.resPicked); frag.append(node);
+    if (S.tgtDbs && !tdb.has(db)) node.append(h('span', { class: 'st NODB', title: '대상 클러스터에 이 DB가 없습니다 (다른 곳에서 삭제됨)' }, '대상에 DB 없음'));
+    if (!open) continue;
+    for (const k of by[db]) {
+      const st = dropState(k) || resultStatus(k), hs = S.history[k], [, t] = split(k), sk = srcOfResult(k);
+      frag.append(h('div', { class: 'node tbl clickable' + (S.resPicked.has(k) || S.logFilter === sk ? ' picked' : ''), 'data-k': k,
+                             title: (sk !== k ? `원본: ${sk}\n` : '') + (hs && hs.message ? hs.message + '\n' : '') + '클릭: 이 테이블 로그만 보기',
+                             onclick: e => { if (e.target.tagName !== 'INPUT') showLogFor(sk); } },
+        h('input', { type: 'checkbox', checked: S.resPicked.has(k),
+                     onchange: e => { e.target.checked ? S.resPicked.add(k) : S.resPicked.delete(k); renderResult(); } }),
+        h('span', { class: 'name' }, t),
+        split(sk)[0] !== split(k)[0] ? h('span', { class: 'num', title: '원본 DB' }, '← ' + split(sk)[0]) : null,
+        S.queue.includes(sk) ? h('span', { class: 'mark', title: '이관 목록에 들어 있음' }, '목록') : null,
+        countPending(k) ? h('span', { class: 'num', title: '이번 실행의 결과 기록(행 수)을 불러오는 중입니다. 몇 초 안에 표시됩니다.' }, '행 수 불러오는 중')
+          : hs && hs.status === st && !dropState(k) ? rowsText(k) : null,
+        stBadge(st)));
+    }
+  }
+  if (!all.size && !emptyDbs.length) frag.append(h('div', { class: 'empty' }, S.tgtDbs ? '아직 이관 결과가 없습니다.' : '대상 DB 목록을 불러오는 중…'));
+  else if (!keys.length && !emptyDbs.length) frag.append(h('div', { class: 'empty' }, '조건에 맞는 결과 없음'));
+  if (S.tgtDbsErr) frag.append(h('div', { class: 'empty' }, '대상 목록 조회 실패 (도구 기록으로 표시 중): ' + S.tgtDbsErr.slice(0, 120)));
+  if (S.tgtTables) {
+    const gone = Object.keys(S.history).filter(k => !all.has(k)).length;
+    if (gone) frag.append(h('div', { class: 'empty', title: '이 도구의 기록에는 있지만 대상 클러스터에 지금 없는 테이블 (다른 곳에서 삭제됨 등). 결과 칸은 대상 기준이라 표시하지 않습니다.' },
+      `기록에는 있지만 대상에 없는 테이블 ${gone}개는 표시하지 않습니다`));
+  }
+  const tree = $('resultTree'), top = tree.scrollTop; tree.replaceChildren(frag); tree.scrollTop = top;
+  followNewResults(tree, all);
+}
+// 새로 추가된 결과가 보이도록 스크롤 (목록은 DB·테이블 이름순이라 새 항목이 맨 아래라고 할 수 없어 그 항목으로 이동).
+// 사용자가 결과 칸을 직접 스크롤/클릭한 뒤 15초 동안은 따라가지 않음.
+function followNewResults(tree, all) {
+  const prev = S.prevResKeys; S.prevResKeys = all;
+  if (!prev || Date.now() - (S.resTouchedAt || 0) < 15000) return;
+  let last = null;
+  for (const el of tree.querySelectorAll('[data-k]')) if (!prev.has(el.dataset.k)) last = el;   // 화면 순서상 가장 아래 새 항목
+  if (!last) return;
+  // 자동 스크롤은 아래로만: 새 항목이 지금 보이는 곳보다 위에 끼어들면 움직이지 않음
+  const below = last.getBoundingClientRect().bottom - tree.getBoundingClientRect().bottom;   // >0: 화면 아래에 가려짐
+  if (below > 0) tree.scrollTop += below + 4;
+}
+// 칸 맨 아래 설명 줄 높이를 세 칸 모두 같게 (가장 긴 이관 결과 설명 기준). 창 크기·요약 숫자가 바뀌면 다시 맞춤
+function equalizeFoot() {
+  const feet = [...document.querySelectorAll('.panel-foot')];
+  feet.forEach(f => f.style.minHeight = '');
+  const hmax = Math.max(...feet.map(f => f.offsetHeight));
+  feet.forEach(f => f.style.minHeight = hmax + 'px');
+}
+window.addEventListener('resize', equalizeFoot);
+if (window.ResizeObserver) { const ro = new ResizeObserver(() => requestAnimationFrame(equalizeFoot));
+  document.querySelectorAll('main > .panel').forEach(p => ro.observe(p)); }
+for (const id of ['srcSub', 'cntList', 'cntResult'])   // 요약 숫자가 바뀌면 줄 수가 달라질 수 있음
+  new MutationObserver(() => requestAnimationFrame(equalizeFoot)).observe($(id), { childList: true, characterData: true, subtree: true });
+equalizeFoot();
+for (const ev of ['wheel', 'mousedown', 'touchstart', 'keydown'])
+  $('resultTree').addEventListener(ev, () => { S.resTouchedAt = Date.now(); }, { passive: true });
+// 실행 중인 이관의 실제 동시 처리 수를 입력 칸에 표시 (페이지를 다시 열어도 2로 돌아가지 않게)
+function syncParallel(j) {
+  if (!(j && j.running && (j.kind === 'migrate' || j.kind === 'dry-run'))) return;
+  const n = parseInt(String(j.parallel || '').replace(/\D/g, ''), 10);
+  if (n > 0 && document.activeElement !== $('optParallel')) $('optParallel').value = n;
+}
+// 동시 처리 수: 이관 실행 중에 바꾸면 바로 반영 (줄이면 진행 중인 테이블은 끝까지 둠)
+$('optParallel').addEventListener('change', async () => {
+  const j = S.job;
+  if (!(j && j.running && (j.kind === 'migrate' || j.kind === 'dry-run'))) return;   // 다음 실행에 적용
+  const n = Math.max(1, Math.min(64, Math.round(Number($('optParallel').value)) || 2));
+  $('optParallel').value = n;
+  try {
+    await api('/api/parallel', { parallel: n });
+    toast(`동시 처리 ${n}개로 변경 - 몇 초 안에 반영됩니다` + (n < (parseInt(String(j.parallel).replace(/\D/g, '')) || 0) ? ' (진행 중인 테이블은 끝까지 진행)' : ''));
+  } catch (e) { toast('동시 처리 변경 실패: ' + e.message, true); }
+});
+// 모두 펼치기 / 모두 접기 (칸마다)
+$('btnExpandSrc').onclick = async () => {
+  if (S.searchRows) return;   // 검색 결과는 늘 펼쳐져 있음
+  const dbs = S.dbs.map(d => d.db), btn = $('btnExpandSrc'); btn.disabled = true;
+  try {
+    for (let i = 0; i < dbs.length; i += 8) await Promise.all(dbs.slice(i, i + 8).map(db => ensureTables(db)));
+    dbs.forEach(db => S.open.add(db));
+  } finally { btn.disabled = false; }
+  renderSource();
+};
+$('btnCollapseSrc').onclick = () => { S.open.clear(); renderSource(); };
+for (const [pane, sfx] of [['list', 'List'], ['result', 'Result']]) {
+  $('btnExpand' + sfx).onclick = () => {
+    for (const db of S.paneDbs[pane] || []) S.tgtOpen.delete(pane + ':' + db);
+    renderTarget();
+  };
+  $('btnCollapse' + sfx).onclick = () => {
+    for (const db of S.paneDbs[pane] || []) S.tgtOpen.add(pane + ':' + db);
+    renderTarget();
+  };
+}
+$('btnTgtRefresh').onclick = async () => { $('btnTgtRefresh').disabled = true; await loadTargetDbs(true); $('btnTgtRefresh').disabled = false; };
+$('listSearch').oninput = renderList;
+$('resultSearch').oninput = $('resultState').onchange = renderResult;
+
+// ------------------------------------------------------------------ 목록에 추가 / 제외 / CSV
+function addToQueue(keys) {
+  let n = 0;
+  for (const k of keys) if (!S.queue.includes(k)) { S.queue.push(k); n++; }
+  S.queue.sort(); saveQueue(); return n;
+}
+async function renameDb(db) {
+  const r = await ask({ title: `대상 DB 이름 바꾸기: ${db}`, ok: '적용',
+    body: `이관 목록에 있는 ${db}의 모든 테이블을 대상 클러스터에서 아래 DB 이름으로 만듭니다. 테이블 이름은 그대로입니다.\n` +
+          `• external 테이블과 사용자 지정 경로는 경로 중 DB 이름 부분(${db}, ${db}.db)도 새 이름으로 바뀝니다.\n` +
+          `• 비워 두면 원본과 같은 이름(${db})을 씁니다.`,
+    text: { value: tgtDbOf(db), placeholder: db } });
+  if (!r) return;
+  const v = (r.text || db).toLowerCase();
+  if (!/^[a-z0-9_]+$/.test(v)) return toast('DB 이름은 영문 소문자, 숫자, _ 만 쓸 수 있습니다', true);
+  // 같은 대상 DB로 모이는 다른 원본 DB와 테이블 이름이 겹치면 실행 시 막히므로 미리 알림
+  const clash = S.queue.filter(k => split(k)[0] !== db && tgtDbOf(split(k)[0]) === v)
+    .filter(k => S.queue.some(q => split(q)[0] === db && split(q)[1] === split(k)[1]));
+  if (v === db) delete S.dbMap[db]; else S.dbMap[db] = v;
+  saveQueue(); renderList();
+  toast(v === db ? `${db}: 원본과 같은 이름으로 이관합니다` : `${db} → ${v} 로 이관합니다` +
+        (clash.length ? ` (주의: ${clash.length}개 테이블 이름이 다른 원본 DB와 겹쳐 실행 시 막힙니다)` : ''), clash.length > 0);
+}
+$('btnAdd').onclick = () => {
+  if (!S.picked.size) return toast('왼쪽에서 원본 테이블을 먼저 체크하세요');
+  const n = addToQueue(S.picked), dup = S.picked.size - n; S.picked.clear();
+  toast(`이관 목록에 ${n}개를 추가했습니다` + (dup ? ` (이미 있는 ${dup}개 제외)` : ''));
+  renderSource(); renderTarget();
+};
+$('btnRemove').onclick = () => {
+  if (!S.tgtPicked.size) return toast('[이관 목록]에서 뺄 테이블을 체크하세요');
+  const n = S.tgtPicked.size;
+  S.queue = S.queue.filter(k => !S.tgtPicked.has(k)); S.tgtPicked.clear(); saveQueue();
+  toast(`이관 목록에서 ${n}개를 뺐습니다`); renderSource(); renderTarget();
+};
+$('btnClear').onclick = async () => {
+  if (!S.queue.length) return;
+  if (!await ask({ title: '이관 목록 비우기', body: `이관 목록 ${S.queue.length}개를 모두 비웁니다.\n대상 클러스터는 바뀌지 않습니다.`, ok: '비우기' })) return;
+  S.queue = []; S.tgtPicked.clear(); saveQueue(); renderSource(); renderTarget();
+};
+$('btnRetry').onclick = () => {
+  // 마지막 시도가 실패한 원본 테이블 전부 (결과 칸에 안 나오는, 테이블을 만들기 전 실패도 포함)
+  const bad = Object.keys(S.srcHist).filter(k => BAD.has(srcStatus(k)) && srcStatus(k) !== 'UNSUPPORTED');
+  for (const k of bad) { const t = S.srcHist[k].tgt, sdb = split(k)[0], tdb = t ? split(t)[0] : sdb; if (sdb !== tdb) S.dbMap[sdb] = tdb; }
+  const badT = bad.map(k => S.srcHist[k].tgt || k);
+  if (!bad.length) return toast('실패한 테이블이 없습니다');
+  const n = addToQueue(bad);
+  // 불일치(MISMATCH) 테이블은 대상에 남아 있어서 '건너뜀'이면 다시 건너뛴다
+  const mism = bad.some(k => srcStatus(k) === 'MISMATCH') || badT.some(k => k in S.history);
+  if (mism && $('optIfExists').value === 'skip') $('optIfExists').value = 'replace';
+  toast(`실패 건 ${n}개를 이관 목록에 추가했습니다` + (mism ? ". 불일치 테이블은 대상에 남아 있어 '지우고 다시 만듦'으로 바꿨습니다" : ''));
+  renderSource(); renderTarget();
+};
+$('btnExport').onclick = () => {
+  if (!S.queue.length) return toast('이관 목록이 비어 있습니다');
+  const ren = S.queue.some(k => tgtDbOf(split(k)[0]) !== split(k)[0]);
+  const lines = [ren ? 'db,table,tgt_db' : 'db,table',
+                 ...S.queue.map(k => { const [db, t] = split(k); return ren ? [db, t, tgtDbOf(db)].join(',') : db + ',' + t; })];
+  const a = h('a', { href: URL.createObjectURL(new Blob([lines.join('\n') + '\n'], { type: 'text/csv' })),
+                     download: 'sources.csv' });
+  document.body.append(a); a.click(); a.remove();
+};
+$('btnImport').onclick = () => $('fileImport').click();
+$('fileImport').onchange = async e => {
+  const file = e.target.files[0]; e.target.value = ''; if (!file) return;
+  const text = await file.text(); const keys = [], miss = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim(); if (!line || line.startsWith('#')) continue;
+    const [db, t, tdb] = line.split(',').map(s => (s || '').trim().replace(/^"|"$/g, ''));
+    if (!db || !t || (db === 'db' && t === 'table')) continue;
+    if (tdb && tdb !== db && /^[a-z0-9_]+$/i.test(tdb)) S.dbMap[db] = tdb.toLowerCase();
+    if (t === '*') {
+      if (!S.dbs.some(d => d.db === db)) { miss.push(db + '.*'); continue; }
+      for (const r of await ensureTables(db)) if (selectable(r)) keys.push(key(db, r.table));
+    } else keys.push(key(db, t));
+  }
+  const n = addToQueue(keys);
+  toast(`이관 목록에 ${n}개를 추가했습니다` + (miss.length ? ` (인벤토리에 없는 DB: ${miss.join(', ')})` : ''), miss.length > 0);
+  renderSource(); renderTarget();
+};
+
+// ------------------------------------------------------------------ 실행 / 중지
+function opts() {
+  return { if_exists: $('optIfExists').value, validate: $('optValidate').value,
+           parallel: Number($('optParallel').value) || 2,
+           repair_source: $('optRepair').checked };
+}
+async function run(dry) {
+  if (!S.queue.length) return toast('이관 목록이 비어 있습니다', true);
+  const o = opts();
+  if (!dry) {
+    let msg = `이관 목록의 ${S.queue.length}개 테이블을 대상 클러스터로 옮깁니다.\n\n대상에 이미 있으면: ${$('optIfExists').selectedOptions[0].text}\n` +
+              `검증: ${$('optValidate').selectedOptions[0].text}\n동시 처리: ${o.parallel}개\n원본 0행이면 MSCK 복구: ${o.repair_source ? '예' : '아니오'}`;
+    const ren = [...new Set(S.queue.map(k => split(k)[0]))].filter(db => tgtDbOf(db) !== db);
+    if (ren.length) msg += '\n\nDB 이름 바꾸기 (external 경로의 DB 이름도 바뀜):\n' + ren.map(db => `  ${db} → ${tgtDbOf(db)}`).join('\n');
+    if (o.if_exists === 'replace') msg += '\n\n※ 대상에 이미 있는 테이블은 지우고(데이터 포함) 원본에서 다시 만듭니다.';
+    if (!await ask({ title: '이관 실행', body: msg, ok: '이관 실행' })) return;
+  }
+  try {
+    await api('/api/migrate', Object.assign(o, { dry_run: dry, items: S.queue.map(k => { const [db, t] = split(k); return [db, t, tgtDbOf(db)]; }) }));
+    S.logOffset = 0; S.logLines = []; S.logFilter = null; openLog(true);
+    toast(dry ? 'Dry-run 시작' : '이관 시작'); poll();
+  } catch (e) { toast(e.message, true); }
+}
+$('btnRun').onclick = () => run(false);
+$('btnDry').onclick = () => run(true);
+
+$('btnDropTarget').onclick = async () => {
+  const keys = [...S.resPicked].sort(), emptyPicked = [...S.resDbPicked].sort();
+  if (!keys.length && !emptyPicked.length) return;
+  const byDb = groupByDb(keys), all = resultKeySet();
+  // 결과에 있는 이 DB의 테이블을 전부 골랐으면 "DB 전체 삭제"로 보고 DB 삭제 옵션을 보여준다
+  const wholeDbs = Object.keys(byDb).filter(db => byDb[db].length === [...all].filter(k => split(k)[0] === db).length).sort();
+  const lines = Object.keys(byDb).sort().map(db => `  • ${db}: ${byDb[db].length}개` + (wholeDbs.includes(db) ? ' (결과의 전체)' : '') +
+    (byDb[db].length <= 5 ? ' — ' + byDb[db].map(k => split(k)[1]).join(', ') : ''));
+  if (emptyPicked.length) lines.push(`  • DB 삭제: ${emptyPicked.join(', ')} (이관 결과 없는 DB — 비어 있을 때만 삭제, 테이블이 있으면 그대로 둠)`);
+  const r = await ask({
+    title: `대상 클러스터에서 삭제` + (keys.length ? ` — 테이블 ${keys.length}개` : '') + (emptyPicked.length ? ` · DB ${emptyPicked.length}개` : ''),
+    danger: true, ok: '삭제', typeWord: '삭제',
+    body: [lines.join('\n') + '\n\n',
+           '• managed/ACID: 테이블과 데이터를 휴지통 없이 바로 삭제\n• external: 테이블과 대상 경로의 파일 삭제\n• 원본 클러스터는 바뀌지 않습니다.\n',
+           h('span', { class: 'warn' }, '되돌릴 수 없습니다.')],
+    checks: wholeDbs.length ? [{ id: 'db', checked: true,
+      label: `DB도 삭제: ${wholeDbs.join(', ')} — 체크하지 않으면 DB는 대상에 빈 DB로 남습니다. 체크하면 테이블을 지운 뒤 DB가 비어 있을 때만 DROP DATABASE` }] : [],
+  });
+  if (!r) return;
+  try {
+    const dropDbs = (r.checks.db ? wholeDbs : []).concat(emptyPicked);
+    await api('/api/drop', { items: keys.map(split), confirm: '삭제', drop_dbs: dropDbs });
+    S.lastDrop = { wholeDbs, dropDbs };
+    S.logOffset = 0; S.logLines = []; S.logFilter = null; openLog(true);
+    toast('대상 테이블 삭제 시작'); poll();
+  } catch (e) { toast(e.message, true); }
+};
+
+function openStop(on) { $('stopModal').classList.toggle('open', on); }
+$('btnStop').onclick = () => {
+  const j = S.job || {}, mig = j.kind === 'migrate' || j.kind === 'dry-run' || j.kind === 'drop';
+  $('stopGraceful').hidden = !mig || !!j.stopping;          // 이미 중지 요청을 보냈으면 더 약한 방식은 숨김
+  $('stopNow').hidden = j.stopping === 'now';
+  $('stopForce').hidden = !j.stopping;                       // 강제 종료는 중지가 응답 없을 때만
+  openStop(true);
+};
+$('stopCancel').onclick = () => openStop(false);
+$('stopModal').onclick = e => { if (e.target === $('stopModal')) openStop(false); };
+for (const [id, mode] of [['stopGraceful', 'graceful'], ['stopNow', 'now'], ['stopForce', 'force']])
+  $(id).onclick = async () => {
+    openStop(false);
+    if (mode === 'force' && !await ask({ title: '강제 종료', danger: true, ok: '강제 종료',
+      body: `되돌리기와 결과 기록 없이 바로 끝냅니다.\n만들다 만 대상 테이블이 남을 수 있어, 다시 실행할 때 '지우고 다시 만듦'이 필요합니다.` })) return;
+    try { await api('/api/stop', { mode }); toast('중지 요청을 보냈습니다'); poll(); } catch (e) { toast(e.message, true); }
+  };
+$('btnInventory').onclick = async () => {
+  if (!await ask({ title: '인벤토리 새로고침', ok: '시작',
+    body: '원본 클러스터의 전체 DB를 조회해서 인벤토리를 새로 만듭니다 (읽기 전용).\n테이블이 많으면 오래 걸립니다.' })) return;
+  try { await api('/api/inventory', {}); S.logOffset = 0; S.logLines = []; S.logFilter = null; openLog(true); poll(); }
+  catch (e) { toast(e.message, true); }
+};
+
+// ------------------------------------------------------------------ 진행 / 로그
+function renderJob() {
+  const j = S.job, running = j && j.running;
+  for (const id of ['btnRun', 'btnDry', 'btnInventory']) $(id).disabled = !!running;
+  $('btnStop').disabled = !running || j.stopping === 'force';
+  $('btnStop').textContent = running && j.stopping ? '중지 중… (더 강하게)' : '중지';
+  const fill = $('fill'), counts = $('counts'); counts.replaceChildren();
+  $('progressTrack').hidden = !running;
+  $('jobText').classList.toggle('idle', !running);
+  if (!j || !j.kind) { $('jobText').textContent = '대기 중'; fill.style.width = '0'; return; }
+  const name = { migrate: '이관', 'dry-run': 'Dry-run', inventory: '인벤토리', drop: '대상 삭제' }[j.kind];
+  if (j.kind === 'inventory') {
+    $('jobText').textContent = running ? `인벤토리 조회 중… (${j.started} 시작)` :
+      `대기 중 · 마지막 작업: 인벤토리 ${j.rc === 0 ? '완료' : '실패 (rc=' + j.rc + ')'} ${j.finished}`;
+    fill.style.width = running ? '100%' : '0'; fill.className = 'fill'; return;
+  }
+  const planning = running && j.phase === 'plan';
+  // 전체 진행률 하나로 0→100%: 1단계(메타데이터 조회) 20% + 2단계(이관) 80%. 대상 삭제는 완료 수 그대로
+  const META_W = 20;
+  const pct = !j.total ? 0 : j.kind === 'drop' ? Math.round(j.done * 100 / j.total)
+    : Math.min(100, Math.round((j.meta_done * META_W + j.done * (100 - META_W)) / j.total));
+  const cnt = {}; for (const v of Object.values(j.items)) cnt[v] = (cnt[v] || 0) + 1;
+  const bad = Object.keys(cnt).some(s => BAD.has(s));
+  fill.style.width = (running ? pct : 100) + '%';
+  fill.className = 'fill' + (running ? '' : bad || j.rc ? ' done-bad' : ' done-ok');
+  $('jobText').textContent = running
+    ? (j.kind === 'drop' ? (j.total ? `대상 삭제 중: 완료 ${j.done}/${j.total}` : '대상 DB 삭제 중…')
+       : `전체 ${pct}% · ` + (planning ? `1/2단계 준비: 원본 메타데이터 조회 ${j.meta_done}/${j.total}`
+                : `2/2단계 ${name}: 완료 ${j.done}/${j.total}` + (j.parallel ? ` (동시 처리: ${String(j.parallel).replace(/^동시\s*/, '')})` : ''))) + (j.stopping ? { graceful: ' (진행 중인 테이블 끝나면 중지)', now: ' (중지·되돌리는 중…)', force: ' (강제 종료 중…)' }[j.stopping] : '')
+    : `대기 중 · 마지막 작업: ${name} ${j.finished} 종료` + (j.rc && !bad ? ` (rc=${j.rc})` : '');
+  for (const [s0, n] of Object.entries(cnt)) {
+    const s = j.kind === 'drop' ? (s0 === 'PENDING' ? 'DELQ' : s0 === 'RUNNING' ? 'DELETING' : s0) : s0;
+    counts.append(h('span', { class: 'st ' + s.split(' ')[0] }, `${LABEL[s] || s} ${n}`));
+  }
+}
+function logClass(l) {
+  if (l.startsWith('$ ')) return 'cmd';
+  if (/=> (OK|SKIPPED|DRY-RUN|DROPPED)/.test(l)) return 'ok';
+  if (/=> (MISMATCH|FAILED|STOPPED)|ABORTED|Traceback|Error|중지|STOP|ROLLBACK|rolled back/.test(l)) return 'bad';
+  return null;
+}
+function renderLog() {
+  const pre = $('logBody');
+  const lines = S.logFilter ? S.logLines.filter(l => l.includes('[' + S.logFilter + ']')) : S.logLines;
+  $('logTitle').textContent = S.logFilter ? `로그 — ${S.logFilter}` : '로그';
+  $('btnLogAll').hidden = !S.logFilter;
+  const frag = document.createDocumentFragment();
+  for (const l of lines.slice(-3000)) { const c = logClass(l); frag.append(c ? h('span', { class: c }, l) : l, '\n'); }
+  if (S.logFilter && !lines.length) frag.append('이번 실행 로그에 이 테이블 기록이 없습니다.\n' +
+      (S.srcHist[S.logFilter] ? `마지막 결과(run ${S.srcHist[S.logFilter].run_id}): ${S.srcHist[S.logFilter].status} ${S.srcHist[S.logFilter].message}` : ''));
+  pre.replaceChildren(frag);
+  if ($('logFollow').checked) pre.scrollTop = pre.scrollHeight;
+}
+function openLog(on) { $('log').classList.toggle('open', on); $('btnLog').textContent = on ? '로그 ▾' : '로그 ▴'; }
+$('btnLog').onclick = () => openLog(!$('log').classList.contains('open'));
+$('btnLogAll').onclick = () => { S.logFilter = null; renderLog(); renderTarget(); };
+function showLogFor(k) { S.logFilter = S.logFilter === k ? null : k; openLog(true); renderLog(); renderTarget(); }
+
+let pollTimer;
+async function poll() {
+  clearTimeout(pollTimer);
+  try {
+    let j = await api('/api/job?offset=' + S.logOffset);
+    if (S.boot && j.boot !== S.boot) { location.reload(); return; }   // 서버 재시작(화면 코드가 바뀌었을 수 있음)
+    S.boot = j.boot;
+    const id = j.kind + j.started;
+    if (S.jobId && S.jobId !== id && S.logOffset) {   // 다른 탭 등에서 새 작업이 시작됨: 처음부터 다시 읽기
+      S.logOffset = 0; S.logLines = [];
+      j = await api('/api/job?offset=0');
+    }
+    S.jobId = id;
+    S.logLines.push(...j.lines); S.logOffset = j.next;
+    if (S.logLines.length > 20000) S.logLines.splice(0, S.logLines.length - 20000);
+    S.job = j; syncParallel(j);
+    if (S.wasRunning && !j.running) await onJobDone(j);
+    if (j.running && Date.now() - (S.tgtLoadedAt || 0) > 60000) {   // 작업 중에는 1분마다 대상 목록과 결과 기록 다시 읽기
+      loadTargetDbs(true); loadHistory().then(renderTarget).catch(() => {});
+    } else if (j.running && Date.now() - (S.histLoadedAt || 0) > 3000
+               && Object.keys(liveTargets()).some(countPending)) {   // 방금 끝난 테이블의 행 수: 3초 안에 채움
+      S.histLoadedAt = Date.now(); loadHistory().then(renderTarget).catch(() => {});
+    }
+    S.wasRunning = j.running;
+    renderJob(); if (j.lines.length) renderLog(); renderTarget();
+    if (j.kind === 'migrate' && j.items) {   // 원본 트리의 이번 실행 상태 (바뀔 때만 다시 그림)
+      const sig = j.running + ':' + j.done + ':' + Object.values(j.items).filter(v => v === 'RUNNING').length + ':' + j.started;
+      if (sig !== S.srcSig) { S.srcSig = sig; renderSource(); }
+    }
+  } catch (e) { $('jobText').textContent = '서버 연결 끊김: ' + e.message; }
+  pollTimer = setTimeout(poll, S.job && S.job.running ? 1000 : 5000);
+}
+async function onJobDone(j) {
+  if (j.kind === 'inventory') {
+    await loadInfo(); await loadSource();
+    toast(j.rc === 0 ? '인벤토리를 새로 읽었습니다' : '인벤토리 실행 실패 — 로그를 확인하세요', j.rc !== 0);
+    return;
+  }
+  await loadHistory();
+  loadTargetDbs(true);   // 이관/삭제로 대상 DB가 생기거나 없어졌을 수 있음
+  if (j.kind === 'drop') {
+    S.resPicked.clear(); S.resDbPicked.clear();
+    const n = Object.values(j.items).filter(s => s === 'DROPPED').length, bad = j.total - n;
+    // DB 처리 결과: 로그의 [db:이름] 줄 + 이번에 DB 삭제를 고르지 않은 DB
+    const dropped = [], kept = [];
+    for (const l of j.lines) {
+      const m = l.match(/\[db:([^\]]+)\] database \S+ (dropped|NOT dropped)/);
+      if (m) (m[2] === 'dropped' ? dropped : kept).push(m[1] + (m[2] === 'dropped' ? '' : '(다른 테이블이 있어 유지)'));
+    }
+    const ld = S.lastDrop || { wholeDbs: [], dropDbs: [] };
+    for (const db of ld.wholeDbs) if (!ld.dropDbs.includes(db)) kept.push(db + '(빈 DB로 남음)');
+    toast(`대상에서 ${n}개 삭제` + (dropped.length ? ` · DB 삭제됨: ${dropped.join(', ')}` : '') +
+          (kept.length ? ` · DB는 남아 있음: ${kept.join(', ')}` : '') +
+          (bad ? ` — 실패/중지 ${bad}개, 로그를 확인하세요` : ''), bad > 0);
+    S.lastDrop = null;
+    renderSource(); renderTarget();
+    return;
+  }
+  if (!j.dry_run) {   // 성공/건너뜀은 이관 목록에서 빼고, 실패는 남겨서 다시 실행할 수 있게
+    const done = Object.entries(j.items).filter(([, s]) => s === 'OK' || s === 'SKIPPED').map(([k]) => k);
+    S.queue = S.queue.filter(k => !done.includes(k)); saveQueue();
+  }
+  const bad = Object.values(j.items).filter(s => BAD.has(s)).length;
+  toast(`${j.dry_run ? 'Dry-run' : '이관'} 종료` + (bad ? ` — 실패/불일치 ${bad}개` : ''), bad > 0);
+  renderSource();
+}
+
+// ------------------------------------------------------------------ 시작
+(async () => {
+  loadQueue();
+  try { await loadInfo(); await Promise.all([loadSource(), loadHistory()]); }
+  catch (e) { toast('불러오기 실패: ' + e.message, true); }
+  renderSource(); renderTarget(); loadTargetDbs(false);
+  const j = await api('/api/job?offset=0').catch(() => null);
+  if (j && j.kind) { S.logLines = j.lines; S.logOffset = j.next; S.job = j; S.wasRunning = j.running;
+                     renderJob(); renderLog(); if (j.running) openLog(true);
+                     syncParallel(j); }
+  poll();
+})();
+</script>
+</body>
+</html>

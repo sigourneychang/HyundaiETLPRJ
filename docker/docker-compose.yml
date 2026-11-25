@@ -1,0 +1,163 @@
+# Two independent Hive 2.3.2 clusters (each with its own HDFS + metastore + HS2)
+# to reproduce a cluster-to-cluster migration:  src cluster  ->  tgt cluster
+#
+#   start:  docker compose -f docker/docker-compose.yml up -d
+#   stop:   docker compose -f docker/docker-compose.yml stop        (data kept)
+#   reset:  docker compose -f docker/docker-compose.yml down -v     (data deleted)
+#
+# Native arm64 images (no Rosetta): Hadoop/Hive run from hive2-arm:2.3.2 (docker/arm/Dockerfile,
+# same Hadoop 2.7.4 / Hive 2.3.2 as the bde2020 images) and the metastore DB from postgres:9.5.
+#   build once:  docker build -t hive2-arm:2.3.2 docker/arm
+# The previous amd64 (bde2020, Rosetta) setup is kept in docker-compose.amd64.yml.
+# Base images are pulled via mirror.gcr.io (Docker Hub mirror) to avoid pull rate limits (429).
+#
+#                  src cluster                 tgt cluster
+#   HDFS           hdfs://src-namenode:8020    hdfs://tgt-namenode:8020
+#   HDFS web UI    http://localhost:50070      http://localhost:50071
+#   HiveServer2    localhost:10000             localhost:10001
+
+name: hive2-clusters
+
+x-base: &base
+  restart: unless-stopped
+  env_file: ./hive2-common.env
+
+x-images:
+  hive: &img-hive hive2-arm:2.3.2                       # namenode / datanode / metastore / hiveserver2
+  metastore-db: &img-metastore-db mirror.gcr.io/library/postgres:9.5
+
+# metastore DB: on an empty volume postgres creates user hive / db metastore; the Hive schema is
+# created by the metastore service on first start (schematool), existing volumes are used as is
+x-db-env: &db-env
+  POSTGRES_USER: hive
+  POSTGRES_PASSWORD: hive
+  POSTGRES_DB: metastore
+
+x-metastore-cmd: &metastore-cmd /run-metastore.sh   # schema init on an empty DB, then the metastore service
+
+x-nn-health: &nn-health
+  test: ["CMD-SHELL", "curl -f http://localhost:50070/ || exit 1"]
+  interval: 30s
+  retries: 5
+
+x-dn-health: &dn-health
+  test: ["CMD-SHELL", "curl -f http://localhost:50075/ || exit 1"]
+  interval: 30s
+  retries: 5
+
+x-src-env: &src-env
+  CORE_CONF_fs_defaultFS: hdfs://src-namenode:8020
+  HIVE_SITE_CONF_hive_metastore_uris: thrift://src-metastore:9083
+  HIVE_SITE_CONF_javax_jdo_option_ConnectionURL: jdbc:postgresql://src-metastore-db/metastore
+
+x-tgt-env: &tgt-env
+  CORE_CONF_fs_defaultFS: hdfs://tgt-namenode:8020
+  HIVE_SITE_CONF_hive_metastore_uris: thrift://tgt-metastore:9083
+  HIVE_SITE_CONF_javax_jdo_option_ConnectionURL: jdbc:postgresql://tgt-metastore-db/metastore
+
+services:
+  # ======================= SOURCE CLUSTER =======================
+  src-namenode:
+    <<: *base
+    image: *img-hive
+    command: /run-namenode.sh
+    healthcheck: *nn-health
+    container_name: src-namenode
+    environment:
+      <<: *src-env
+      CLUSTER_NAME: src
+    volumes: [src_namenode:/hadoop/dfs/name]
+    ports: ["50070:50070"]
+
+  src-datanode:
+    <<: *base
+    image: *img-hive
+    command: /run-datanode.sh
+    healthcheck: *dn-health
+    container_name: src-datanode
+    environment:
+      <<: *src-env
+      SERVICE_PRECONDITION: "src-namenode:50070"
+    volumes: [src_datanode:/hadoop/dfs/data]
+
+  src-metastore-db:
+    <<: *base
+    image: *img-metastore-db
+    environment: *db-env
+    container_name: src-metastore-db
+    volumes: [src_metastore_db:/var/lib/postgresql/data]
+
+  src-metastore:
+    <<: *base
+    image: *img-hive
+    container_name: src-metastore
+    command: *metastore-cmd
+    environment:
+      <<: *src-env
+      SERVICE_PRECONDITION: "src-namenode:50070 src-datanode:50075 src-metastore-db:5432"
+
+  src-hiveserver2:
+    <<: *base
+    image: *img-hive
+    container_name: src-hiveserver2
+    environment:
+      <<: *src-env
+      SERVICE_PRECONDITION: "src-metastore:9083"
+    ports: ["10000:10000"]
+
+  # ======================= TARGET CLUSTER =======================
+  tgt-namenode:
+    <<: *base
+    image: *img-hive
+    command: /run-namenode.sh
+    healthcheck: *nn-health
+    container_name: tgt-namenode
+    environment:
+      <<: *tgt-env
+      CLUSTER_NAME: tgt
+    volumes: [tgt_namenode:/hadoop/dfs/name]
+    ports: ["50071:50070"]
+
+  tgt-datanode:
+    <<: *base
+    image: *img-hive
+    command: /run-datanode.sh
+    healthcheck: *dn-health
+    container_name: tgt-datanode
+    environment:
+      <<: *tgt-env
+      SERVICE_PRECONDITION: "tgt-namenode:50070"
+    volumes: [tgt_datanode:/hadoop/dfs/data]
+
+  tgt-metastore-db:
+    <<: *base
+    image: *img-metastore-db
+    environment: *db-env
+    container_name: tgt-metastore-db
+    volumes: [tgt_metastore_db:/var/lib/postgresql/data]
+
+  tgt-metastore:
+    <<: *base
+    image: *img-hive
+    container_name: tgt-metastore
+    command: *metastore-cmd
+    environment:
+      <<: *tgt-env
+      SERVICE_PRECONDITION: "tgt-namenode:50070 tgt-datanode:50075 tgt-metastore-db:5432"
+
+  tgt-hiveserver2:
+    <<: *base
+    image: *img-hive
+    container_name: tgt-hiveserver2
+    environment:
+      <<: *tgt-env
+      SERVICE_PRECONDITION: "tgt-metastore:9083"
+    ports: ["10001:10000"]
+
+volumes:
+  src_namenode:
+  src_datanode:
+  src_metastore_db:
+  tgt_namenode:
+  tgt_datanode:
+  tgt_metastore_db:
