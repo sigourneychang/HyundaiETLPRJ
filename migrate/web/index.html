@@ -643,8 +643,11 @@ function renderResult() {
   const q = $('resultSearch').value.trim().toLowerCase(), f = $('resultState').value;
   const all = resultKeySet(), frag = document.createDocumentFragment();
   const nBad = [...all].filter(k => BAD.has(resultStatus(k))).length;
-  const nDb = new Set([...(S.tgtDbs || []), ...[...all].map(k => split(k)[0])]).size;   // 빈 DB 포함
-  $('cntResult').textContent = [`DB ${nDb.toLocaleString()}개, Table ${all.size.toLocaleString()}개`,
+  // 진행 중인 테이블은 목록에서 숨기지만 개수에는 포함 (대상에 만들어지는 중)
+  const running = Object.entries(liveTargets()).filter(([k, st]) => st === 'RUNNING' && !all.has(k)).map(([k]) => k);
+  const nDb = new Set([...(S.tgtDbs || []), ...[...all, ...running].map(k => split(k)[0])]).size;   // 빈 DB 포함
+  $('cntResult').textContent = [`DB ${nDb.toLocaleString()}개, Table ${(all.size + running.length).toLocaleString()}개`
+    + (running.length ? ` (진행중 ${running.length} 포함)` : ''),
     nBad ? `불일치 ${nBad}` : '', S.tgtAt ? `대상 기준 ${S.tgtAt}` : '대상 확인 중…'].filter(Boolean).join(' · ');
   $('btnRetry').disabled = !Object.keys(S.srcHist).some(k => BAD.has(srcStatus(k)) && srcStatus(k) !== 'UNSUPPORTED');
   for (const k of [...S.resPicked]) if (!all.has(k)) S.resPicked.delete(k);
