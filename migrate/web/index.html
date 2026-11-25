@@ -696,7 +696,8 @@ function renderResult() {
   else if (!keys.length && !emptyDbs.length) frag.append(h('div', { class: 'empty' }, '조건에 맞는 결과 없음'));
   if (S.tgtDbsErr) frag.append(h('div', { class: 'empty' }, '대상 목록 조회 실패 (도구 기록으로 표시 중): ' + S.tgtDbsErr.slice(0, 120)));
   if (S.tgtTables) {
-    const gone = Object.keys(S.history).filter(k => !all.has(k)).length;
+    const live = liveTargets();   // 진행 중인 테이블은 '대상에 없음'이 아님 (지우고 다시 만드는 중, 요약 개수에 포함됨)
+    const gone = Object.keys(S.history).filter(k => !all.has(k) && live[k] !== 'RUNNING').length;
     if (gone) frag.append(h('div', { class: 'empty', title: '이 도구의 기록에는 있지만 대상 클러스터에 지금 없는 테이블 (다른 곳에서 삭제됨 등). 결과 칸은 대상 기준이라 표시하지 않습니다.' },
       `기록에는 있지만 대상에 없는 테이블 ${gone}개는 표시하지 않습니다`));
   }
