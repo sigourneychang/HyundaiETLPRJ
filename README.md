@@ -19,7 +19,7 @@ DB 전체나 테이블 단위로 옮기고, 옮긴 뒤 원본과 대상의 행 �
 | `docs/작업노트.md` | 운영 개발 명세 |
 | `docker/` | 로컬 테스트용 두 클러스터 환경 (Hadoop 2.7.4 + Hive 2.3.2, ARM 네이티브) |
 | `scripts/` | 로컬 테스트 도구 (beeline 접속, 샘플 데이터 생성) |
-| `reports/` | 실행 로그와 결과 CSV (Git에 올리지 않음) |
+| `reports/` | 실행 로그와 결과 CSV (Git에 올리지 않음). 같은 내용이 대상의 `migration_meta.migration_result_v2`에도 남고, `--restore-reports`로 되살릴 수 있음 |
 
 ## 사용법
 
@@ -44,6 +44,7 @@ python3 migrate/web_ui.py -c conf/prod.ini
 | `--if-exists` | `resume` | 대상에 이미 있을 때: 같은 원본에서 OK로 옮긴 것은 건너뛰고 나머지는 다시 만듦 / 모두 다시 만듦(`replace`) / 건너뜀(`skip`) / 실패(`fail`) |
 | `--validate` | `auto` | 원본 크기별로 고름: 100G 미만 `checksum`(`count(1)` + `sum(hash(*))`), 1T 미만 `count`(행 수), 그 이상 `files`(원본을 읽지 않고 파일 수·바이트 비교). `none`은 검증 안 함 |
 | `--repair-source` | `true` | 원본 행 수가 0인 파티션 테이블은 원본에서 MSCK REPAIR 실행 |
+| `--restore-reports` | | 이관 대신, `reports/`에 없는 결과 CSV를 대상의 결과 테이블에서 되살림 (엣지 노드를 바꿨을 때) |
 | `--drop-target` | | 이관 대신 목록의 대상 테이블을 삭제 (`--drop-databases`로 빈 DB도 삭제) |
 
 ## 설정

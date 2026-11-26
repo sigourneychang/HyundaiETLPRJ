@@ -14,8 +14,8 @@ ACID tables (transactional=true) are never file-copied: their delta dirs carry
 source-cluster transaction ids that the target metastore doesn't know. They go
 src ACID -> src staging (plain ORC) -> distcp -> tgt staging -> INSERT into tgt ACID.
 Views are recreated after all tables.
-At the end, one row per table is appended to a result table on the target
-cluster ([result] db/table): src/tgt names, src/tgt row counts, is_match.
+Every object is recorded in reports/migration_<run_id>.csv (rewritten while running) and, at the
+end, in a result table on the target cluster ([result] db/table, one partition per run_id, same columns).
 
 Usage:
   python3 migrate/hive_migrate.py -c conf/local.ini -s conf/sources.csv [--dry-run]
@@ -62,7 +62,8 @@ DEFAULTS = {
                # mappers = maps_per_tb per TB (at least the -m in options, at most max_maps)
                'min_rate_mb': '100', 'timeout_factor': '3', 'maps_per_tb': '20', 'max_maps': '200'},
     'staging': {'db': 'zz_migration_stage'},
-    'result': {'db': 'migration_meta', 'table': 'migration_result'},
+    'result': {'db': 'migration_meta', 'table': 'migration_result_v2',
+               'hdfs_dir': '/tmp/hive_migrate'},   # target HDFS dir the result TSV is uploaded to before LOAD
     'inventory': {'batch_size': '200', 'path_batch_size': '100'},
     'run': {'parallel': '2', 'if_exists': 'resume', 'stats': 'copy', 'validate': 'auto',
             'checksum_max_bytes': '100G', 'count_max_bytes': '1T',
@@ -189,6 +190,8 @@ def _run(args, timeout, input_text=None):
     """Run a command, return (rc, stdout, stderr). rc=-1 on timeout."""
     try:
         p = subprocess.run(args, input=input_text, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           # no input: never inherit our stdin (a `docker exec -i` would read the terminal)
+                           stdin=subprocess.DEVNULL if input_text is None else None,
                            universal_newlines=True, timeout=timeout)
         return p.returncode, p.stdout, p.stderr
     except FileNotFoundError:
@@ -265,11 +268,25 @@ class Hadoop:
     def __init__(self, cmd, timeout, log):
         self.cmd, self.timeout, self.log = shlex.split(cmd), timeout, log
 
-    def run(self, who, args, timeout=None, force=False):
+    def run(self, who, args, timeout=None, force=False, input_text=None):
         check_stop(force)
         self.log.debug(who, 'HADOOP> %s' % ' '.join(args))
-        rc, out, err = _run(self.cmd + args, timeout or self.timeout)
+        rc, out, err = _run(self.cmd + args, timeout or self.timeout, input_text)
         return rc, out, err
+
+    def put_text(self, who, text, uri, force=False):
+        """Write text to an HDFS file (overwrites) through stdin: no local file path the hadoop command
+        has to see (works the same when the command runs elsewhere, e.g. in a container)."""
+        rc, out, err = self.run(who, ['fs', '-put', '-f', '-', uri], force=force, input_text=text)
+        if rc != 0:
+            raise CommandError('hadoop fs -put %s: %s' % (uri, _error_text(out, err)))
+        # a command that doesn't pass our stdin on (e.g. `docker exec` without -i) writes an empty file, rc=0
+        want = len(text.encode('utf-8'))
+        rc, out, err = self.run(who, ['fs', '-stat', '%b', uri], force=force)
+        got = next((l.strip() for l in out.split('\n') if l.strip().isdigit()), None)
+        if rc != 0 or got != str(want):
+            raise CommandError('hadoop fs -put %s: %s bytes on HDFS, %d sent (does the hadoop command pass '
+                               'stdin on? e.g. docker exec needs -i)' % (uri, got, want))
 
     def file_count(self, who, uri):
         """Number of files under uri, or None if the path doesn't exist."""
@@ -424,17 +441,6 @@ def col_list(cols):
     return ',\n  '.join('`%s` %s' % (n, t) for n, t in cols)
 
 
-def sql_str(v):
-    """Hive string literal (Hive escapes quotes with a backslash, not by doubling)."""
-    if v is None:
-        return 'NULL'
-    return "'%s'" % str(v).replace('\\', '\\\\').replace("'", "\\'")
-
-
-def sql_num(v):
-    return 'NULL' if v is None else str(int(v))
-
-
 # --------------------------------------------------------------------------- job model
 class Job:
     def __init__(self, src_db, table, tgt_db=None):
@@ -472,11 +478,6 @@ class Job:
     @property
     def partitioned(self):
         return bool(self.meta and self.meta['partition_cols'])
-
-    @property
-    def is_match(self):
-        """Source and target row counts are known and equal."""
-        return self.src_rows is not None and self.tgt_rows is not None and self.src_rows == self.tgt_rows
 
     def fail(self, status, msg):
         self.status = status
@@ -530,7 +531,8 @@ class Migrator:
         self.stage_db = cfg['staging'].get('db', 'zz_migration_stage')
         res = cfg['result'] if cfg.has_section('result') else {}
         self.result_db = res.get('db', 'migration_meta')
-        self.result_table = res.get('table', 'migration_result')
+        self.result_table = res.get('table', 'migration_result_v2')
+        self.result_dir = res.get('hdfs_dir', '/tmp/hive_migrate').rstrip('/')
         maxp = r.get('max_dynamic_partitions', '100000')
         self.dyn_part_settings = [
             'SET hive.exec.dynamic.partition=true',
@@ -1341,31 +1343,66 @@ class Migrator:
                 self.log.info(job.src, '=> %s %s' % (job.status, '; '.join(job.messages)))
 
     # ---------------------------------------------------------------- result table
-    def write_result_table(self, run_id, started, jobs):
-        """Append one row per migrated object to the result table on the target cluster.
-        SKIPPED / DRY-RUN objects weren't migrated in this run and are not recorded."""
-        done = [j for j in jobs if j.status not in ('SKIPPED', 'DRY-RUN')]
-        if self.dry or not done:
+    def write_result_table(self, run_id, jobs, tsv_path):
+        """Record this run in the result table on the target: the same columns as the result CSV, one
+        partition per run_id. The rows go as one TSV file (local copy: tsv_path) uploaded to [result]
+        hdfs_dir and moved in with LOAD DATA ... OVERWRITE, so there is no row limit and recording the same
+        run again replaces its partition. The table's files are also the backup of reports/ (see
+        restore_reports)."""
+        if self.dry or not jobs:
             return
+        text = tsv_text(report_row(j) for j in jobs)
+        with open(tsv_path, 'w', encoding='utf-8') as f:
+            f.write(text)
         fq = '`%s`.`%s`' % (self.result_db, self.result_table)
-        ts = started.strftime('%Y-%m-%d %H:%M:%S')
-        values = ',\n'.join('(%s)' % ', '.join([
-            sql_str(run_id), sql_str(ts), sql_str(j.src_db), sql_str(j.table),
-            sql_str(j.tgt_db), sql_str(j.table), sql_num(j.src_rows), sql_num(j.tgt_rows),
-            'true' if j.is_match else 'false', sql_str(j.status)]) for j in done)
-        self.tgt.run('result', [
-            'CREATE DATABASE IF NOT EXISTS `%s`' % self.result_db,
-            'CREATE TABLE IF NOT EXISTS %s (\n'
-            '  run_id STRING COMMENT "migration run id (yyyymmdd_hhmmss)",\n'
-            '  migrated_at TIMESTAMP COMMENT "run start time",\n'
-            '  src_db STRING, src_table STRING, tgt_db STRING, tgt_table STRING,\n'
-            '  src_count BIGINT, tgt_count BIGINT,\n'
-            '  is_match BOOLEAN COMMENT "src_count = tgt_count",\n'
-            '  status STRING COMMENT "OK | MISMATCH | FAILED | UNSUPPORTED")\n'
-            'STORED AS ORC' % fq,
-            'INSERT INTO TABLE %s VALUES\n%s' % (fq, values)], force=True)
-        self.log.info('result', '%d row(s) written to %s.%s (run_id=%s)'
-                      % (len(done), self.result_db, self.result_table, run_id))
+        staged = '%s%s/migration_%s.tsv' % (self.tgt_uri, self.result_dir, run_id)
+        rc, out, err = self.tgt_fs.run('result', ['fs', '-mkdir', '-p', self.tgt_uri + self.result_dir], force=True)
+        if rc != 0:
+            raise CommandError('hadoop fs -mkdir %s: %s' % (self.result_dir, _error_text(out, err)))
+        self.tgt_fs.put_text('result', text, staged, force=True)
+        self.tgt.run('result', ['CREATE DATABASE IF NOT EXISTS `%s`' % self.result_db, result_table_ddl(fq),
+                                "LOAD DATA INPATH '%s' OVERWRITE INTO TABLE %s PARTITION (run_id='%s')"
+                                % (staged, fq, run_id)], force=True)
+        self.log.info('result', '%d row(s) written to %s.%s (partition run_id=%s)'
+                      % (len(jobs), self.result_db, self.result_table, run_id))
+
+    def restore_reports(self, report_dir):
+        """Rebuild missing reports/migration_<run_id>.csv from the result table (reports/ lost or moved:
+        if_exists=resume and the web UI read their history from these files). Existing files are kept."""
+        fq = '`%s`.`%s`' % (self.result_db, self.result_table)
+        got = require(split_marked(self.tgt.run('restore', [marker('PARTS'), 'SHOW PARTITIONS %s' % fq,
+                                                            marker('DESC'), 'DESCRIBE FORMATTED %s' % fq],
+                                                retry=True)), 'PARTS', 'DESC')
+        loc = parse_describe(got['DESC'])['location']
+        os.makedirs(report_dir, exist_ok=True)
+        restored = kept = 0
+        for p in got['PARTS']:
+            p = p.strip()
+            if not re.match(r'^run_id=\w+$', p):
+                continue
+            run_id = p.split('=', 1)[1]
+            path = os.path.join(report_dir, 'migration_%s.csv' % run_id)
+            if os.path.exists(path):
+                kept += 1
+                continue
+            rc, out, err = self.tgt_fs.run('restore', ['fs', '-cat', '%s/%s/*' % (loc.rstrip('/'), p)])
+            if rc != 0:
+                raise CommandError('hadoop fs -cat %s/%s: %s' % (loc, p, _error_text(out, err)))
+            rows = [l.split('\t') for l in out.split('\n') if l.strip()]
+            tmp = path + '.tmp'
+            with open(tmp, 'w', newline='', encoding='utf-8') as f:
+                w = csv.writer(f)
+                w.writerow(REPORT_COLUMNS)
+                for r in rows:
+                    r = (r + [''] * len(REPORT_COLUMNS))[:len(REPORT_COLUMNS)]
+                    r[3] = {'true': 'True', 'false': 'False'}.get(r[3], r[3])   # partitioned, as write_report writes it
+                    w.writerow(r)
+            os.replace(tmp, path)
+            restored += 1
+            self.log.info('restore', '%s: %d row(s)' % (path, len(rows)))
+        self.log.info('restore', '%d report(s) restored from %s.%s, %d already there'
+                      % (restored, self.result_db, self.result_table, kept))
+        return restored
 
     # ---------------------------------------------------------------- drop (target cleanup)
     def _db_location(self, who, db):
@@ -1616,24 +1653,57 @@ def read_sources(path, allow_empty=False, with_target=False):
     return rows
 
 
+# result CSV columns; the result table has the same columns (types in RESULT_TYPES, others STRING)
+REPORT_COLUMNS = ['src', 'tgt', 'kind', 'partitioned', 'status', 'src_rows', 'tgt_rows',
+                  'tgt_count_star', 'src_checksum', 'tgt_checksum', 'src_partitions',
+                  'tgt_partitions', 'seconds', 'message', 'flags',
+                  'validated_by', 'src_files', 'src_bytes', 'src_ddl_time']
+RESULT_TYPES = {'partitioned': 'BOOLEAN', 'src_rows': 'BIGINT', 'tgt_rows': 'BIGINT', 'tgt_count_star': 'BIGINT',
+                'src_partitions': 'INT', 'tgt_partitions': 'INT', 'seconds': 'DOUBLE',
+                'src_files': 'BIGINT', 'src_bytes': 'BIGINT', 'src_ddl_time': 'BIGINT'}
+
+
+def report_row(j):
+    return [j.src, j.tgt, j.kind, j.partitioned, j.status, j.src_rows, j.tgt_rows,
+            j.tgt_stats_rows, j.src_sum, j.tgt_sum,
+            len(j.src_parts) if j.src_parts is not None else '',
+            len(j.tgt_parts) if j.tgt_parts is not None else '',
+            '%.1f' % j.seconds, '; '.join(j.messages), ';'.join(sorted(j.flags)),
+            # source state when migrated (to find tables changed since, before the cut-over)
+            j.validated_by or '', '' if j.src_files in (None, -1) else j.src_files,
+            '' if j.src_bytes is None else j.src_bytes,
+            (j.meta or {}).get('params', {}).get('transient_lastDdlTime', '')]
+
+
+def tsv_text(rows):
+    """Rows for the result table's text format: tab separated, '' = NULL, booleans lower case.
+    Tabs and line breaks inside a value become spaces (only messages can hold them)."""
+    def cell(v):
+        if v is None:
+            return ''
+        if isinstance(v, bool):
+            return 'true' if v else 'false'
+        return re.sub(r'[\t\r\n]+', ' ', str(v))
+    return ''.join('\t'.join(cell(v) for v in r) + '\n' for r in rows)
+
+
+def result_table_ddl(fq):
+    cols = ',\n'.join('  `%s` %s' % (c, RESULT_TYPES.get(c, 'STRING')) for c in REPORT_COLUMNS)
+    return ("CREATE TABLE IF NOT EXISTS %s (\n%s)\n"
+            "COMMENT 'hive_migrate result: one partition per run, same columns as reports/migration_<run_id>.csv'\n"
+            "PARTITIONED BY (`run_id` STRING)\n"
+            "ROW FORMAT DELIMITED FIELDS TERMINATED BY '\\t'\n"
+            "STORED AS TEXTFILE\n"
+            "TBLPROPERTIES ('serialization.null.format'='')" % (fq, cols))
+
+
 def write_report(path, jobs):
     tmp = path + '.tmp'   # write + rename: a reader (or a crash) never sees a half-written file
     with open(tmp, 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
-        w.writerow(['src', 'tgt', 'kind', 'partitioned', 'status', 'src_rows', 'tgt_rows',
-                    'tgt_count_star', 'src_checksum', 'tgt_checksum', 'src_partitions',
-                    'tgt_partitions', 'seconds', 'message', 'flags',
-                    'validated_by', 'src_files', 'src_bytes', 'src_ddl_time'])
+        w.writerow(REPORT_COLUMNS)
         for j in jobs:
-            w.writerow([j.src, j.tgt, j.kind, j.partitioned, j.status, j.src_rows, j.tgt_rows,
-                        j.tgt_stats_rows, j.src_sum, j.tgt_sum,
-                        len(j.src_parts) if j.src_parts is not None else '',
-                        len(j.tgt_parts) if j.tgt_parts is not None else '',
-                        '%.1f' % j.seconds, '; '.join(j.messages), ';'.join(sorted(j.flags)),
-                        # source state when migrated (to find tables changed since, before the cut-over)
-                        j.validated_by or '', '' if j.src_files in (None, -1) else j.src_files,
-                        '' if j.src_bytes is None else j.src_bytes,
-                        (j.meta or {}).get('params', {}).get('transient_lastDdlTime', '')])
+            w.writerow(report_row(j))
     os.replace(tmp, path)
 
 
@@ -1669,7 +1739,7 @@ def print_summary(jobs):
 def main():
     ap = argparse.ArgumentParser(description='Hive 2.x cluster-to-cluster migration')
     ap.add_argument('-c', '--config', required=True, help='INI config (clusters, distcp, options)')
-    ap.add_argument('-s', '--sources', required=True, help='CSV: db,table (table * = whole db)')
+    ap.add_argument('-s', '--sources', help='CSV: db,table (table * = whole db)')
     ap.add_argument('--dry-run', action='store_true', help='read metadata and print the plan only')
     ap.add_argument('--parallel', type=int, help='override [run] parallel (tables/views at a time)')
     ap.add_argument('--small-parallel', type=int, help=argparse.SUPPRESS)   # removed; accepted and ignored
@@ -1687,8 +1757,12 @@ def main():
                          '(external: table directory removed too). Use with --dry-run to preview')
     ap.add_argument('--drop-databases', default='',
                     help='with --drop-target: also DROP these databases (comma separated) if empty afterwards')
+    ap.add_argument('--restore-reports', action='store_true',
+                    help='instead of migrating: rebuild missing reports/migration_<run_id>.csv from the result table')
     ap.add_argument('--report-dir', default='reports')
     a = ap.parse_args()
+    if not a.sources and not a.restore_reports:
+        ap.error('-s/--sources is required')
 
     cfg = load_config(a.config)
     for key, val in (('parallel', a.parallel),
@@ -1698,6 +1772,14 @@ def main():
             cfg['run'][key] = str(val)
 
     os.makedirs(a.report_dir, exist_ok=True)
+    if a.restore_reports:   # no run of its own: log next to the reports it rebuilds
+        log = Log(os.path.join(a.report_dir, 'restore_%s.log' % datetime.datetime.now().strftime('%Y%m%d_%H%M%S')))
+        try:
+            Migrator(cfg, log, False).restore_reports(a.report_dir)
+        except CommandError as e:
+            log.info('main', 'ABORTED: %s' % e)
+            sys.exit(2)
+        return
     started = datetime.datetime.now()
     run_id = started.strftime('%Y%m%d_%H%M%S')
     base = os.path.join(a.report_dir, 'migration_%s%s' % (run_id, '_dryrun' if a.dry_run else ''))
@@ -1741,7 +1823,7 @@ def main():
     flusher.set()
     write_report(base + '.csv', jobs)
     try:
-        migrator.write_result_table(run_id, started, jobs)
+        migrator.write_result_table(run_id, jobs, base + '.tsv')
     except CommandError as e:   # the migration itself is done; the local report still exists
         log.info('result', 'FAILED to write result table: %s' % e)
     print_summary(jobs)
