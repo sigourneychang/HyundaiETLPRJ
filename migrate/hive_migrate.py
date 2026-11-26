@@ -201,6 +201,13 @@ def _run(args, timeout, input_text=None):
         return -1, dec(e.stdout), dec(e.stderr)
 
 
+def names_path(text, path):
+    """Does a hadoop fs error text name exactly this path? ("rm: `/data/a': ..." must not match /data/ab
+    or /x/data/a). The path may be printed with a scheme://authority in front."""
+    p = path.rstrip('/')
+    return re.search(r"(?:^|[`'\s]|//[^/\s`']*)" + re.escape(p) + r"/?(?=['`\s:]|$)", text, re.M) is not None
+
+
 def _error_text(stdout, stderr):
     lines = [l for l in (stderr + '\n' + stdout).splitlines()
              if re.search(r'Error|Exception|FAILED|No such file', l)]
@@ -1499,15 +1506,169 @@ class Migrator:
             job.seconds = time.time() - t0
             self.log.info(job.src, '=> %s %s' % (job.status, '; '.join(job.messages)))
 
+    @staticmethod
+    def _drop_kind(meta):
+        kind = {'VIRTUAL_VIEW': 'VIEW', 'EXTERNAL_TABLE': 'EXTERNAL', 'MANAGED_TABLE': 'MANAGED'}.get(
+            meta['table_type'], meta['table_type'])
+        return 'ACID' if meta['params'].get('transactional', '').lower() == 'true' else kind
+
+    def _drop_batch(self, batch):
+        """Drop one batch of objects that are on the target: DESCRIBE all of them in one session (kind and
+        path checked right before dropping), DROP them in one more session, then remove the external
+        tables' files with one `hadoop fs -rm` per path_batch paths. Any batch step that fails falls back
+        to drop_table() one by one for the objects still left, so the failing object is the one reported.
+        Returns the external table paths removed (for the empty-parent cleanup)."""
+        t0 = time.time()
+        if STOP_NEW.is_set():
+            for j in batch:
+                j.fail('STOPPED', 'not started (stop requested)')
+                self.log.info(j.src, '=> STOPPED not started')
+            return []
+        stmts = []
+        for i, j in enumerate(batch):
+            stmts += [marker('D%d' % i), 'DESCRIBE FORMATTED `%s`.`%s`' % (j.tgt_db, j.table)]
+        try:
+            got = require(split_marked(self.tgt.run('drop', stmts, retry=True)), *('D%d' % i for i in range(len(batch))))
+        except CommandError as e:
+            self.log.info('drop', 'DESCRIBE batch of %d failed (%s), dropping one by one' % (len(batch), str(e)[:120]))
+            for j in batch:
+                self.drop_table(j)
+            return []
+        todo, paths = [], {}
+        for i, j in enumerate(batch):
+            meta = parse_describe(got['D%d' % i])
+            j.kind = self._drop_kind(meta)
+            path = strip_uri(meta['location']) if j.kind == 'EXTERNAL' else None
+            try:
+                if path:
+                    self._check_drop_path(path)
+            except CommandError as e:
+                j.fail('FAILED', str(e))
+                self.log.info(j.src, '=> %s %s' % (j.status, '; '.join(j.messages)))
+                continue
+            paths[j.src] = path
+            todo.append(j)
+        what = {j.src: '%s%s' % (j.kind, ' + files %s' % paths[j.src] if paths[j.src] else '') for j in todo}
+        if self.dry:
+            for j in todo:
+                j.status = 'DRY-RUN'
+                j.messages.append('would drop %s' % what[j.src])
+                self.log.info(j.src, '=> %s %s' % (j.status, '; '.join(j.messages)))
+            return []
+        self.log.info('drop', 'dropping %d object(s) on target in one session' % len(todo))
+        drops = ['DROP VIEW IF EXISTS `%s`.`%s`' % (j.tgt_db, j.table) if j.kind == 'VIEW'
+                 else 'DROP TABLE IF EXISTS `%s`.`%s` PURGE' % (j.tgt_db, j.table) for j in todo]
+        try:
+            if drops:
+                self.tgt.run('drop', drops)
+        except CommandError as e:   # some may be dropped already: IF EXISTS makes the one-by-one retry safe
+            self.log.info('drop', 'DROP batch of %d failed (%s), dropping one by one' % (len(drops), str(e)[:120]))
+            for j in todo:
+                self.drop_table(j)
+            return []
+        # external tables: the files stay after DROP TABLE -> remove the table directories, many per call
+        ext = [j for j in todo if paths[j.src]]
+        failed = {}
+        for k in range(0, len(ext), self.path_batch):
+            chunk = ext[k:k + self.path_batch]
+            rc, out, err = self.tgt_fs.run('drop', ['fs', '-rm', '-r', '-f', '-skipTrash']
+                                           + [self.tgt_uri + paths[j.src] for j in chunk], force=True)
+            if rc != 0:   # which ones: -rm reports each failing path on stderr
+                for j in chunk:
+                    if names_path(err, paths[j.src]):
+                        failed[j.src] = _error_text(out, err)
+                if not any(j.src in failed for j in chunk):   # can't tell which: say so for the whole chunk
+                    for j in chunk:
+                        failed[j.src] = _error_text(out, err)
+        dt = (time.time() - t0) / max(1, len(batch))
+        removed = []
+        for j in todo:
+            j.seconds = dt
+            if j.src in failed:
+                j.fail('STOPPED' if STOP_NOW.is_set() else 'FAILED', 'table dropped but files not removed: %s: %s'
+                       % (paths[j.src], failed[j.src]))
+            else:
+                j.status = 'DROPPED'
+                j.messages.append('dropped on target: %s' % what[j.src])
+                if paths[j.src]:
+                    removed.append((j.tgt_db, paths[j.src]))
+            self.log.info(j.src, '=> %s %s' % (j.status, '; '.join(j.messages)))
+        return removed
+
+    def _remove_empty_parents_many(self, removed, db_locs):
+        """Empty-parent cleanup after many table directories were removed: the distinct parents, deepest
+        first, one `hadoop fs -rmdir` call per level (a directory that isn't empty just stays). Same limits
+        as _remove_empty_parents: top-level dirs, *.db dirs, warehouse roots and the database's location."""
+        def candidate(db, path):
+            parent = path.rstrip('/').rsplit('/', 1)[0]
+            comps = [x for x in parent.split('/') if x]
+            keep = db_locs.get(db)
+            if len(comps) < 2 or comps[-1].lower().endswith('.db') or (keep and parent == keep) or \
+                    parent.lower() in ('/user/hive/warehouse', '/apps/hive/warehouse', '/warehouse'):
+                return None
+            return parent
+        depth = lambda d: d.count('/')
+        pending = {}   # dir -> db
+        for db, p in removed:
+            c = candidate(db, p)
+            if c:
+                pending[c] = db
+        gone, tried = [], set()
+        while pending:   # deepest level first: its parents can only become empty after it is gone
+            deepest = max(depth(d) for d in pending)
+            dirs = sorted(d for d in pending if depth(d) == deepest)
+            rc, out, err = self.tgt_fs.run('drop', ['fs', '-rmdir'] + [self.tgt_uri + d for d in dirs], force=True)
+            tried.update(dirs)
+            ok = [d for d in dirs if not names_path(err, d)]   # rmdir names each directory it could not remove
+            gone += ok
+            for d in ok:
+                c = candidate(pending[d], d)
+                if c and c not in tried:
+                    pending[c] = pending[d]
+            for d in dirs:
+                pending.pop(d, None)
+        if gone:
+            self.log.info('drop', 'removed empty parent dir(s): %s' % ', '.join(sorted(gone)))
+        return gone
+
     def drop_targets(self, rows, drop_dbs=()):
+        """Drop the listed objects on the TARGET cluster, in batches: what isn't there is settled from one
+        SHOW TABLES per database; the rest goes in batches of meta_batch (see _drop_batch). Only the listed
+        objects are dropped; a database only when it is empty afterwards (no CASCADE)."""
         if any(t == '*' for _, t in rows):
             raise CommandError('drop needs explicit table names (no *)')
         jobs = [Job(db, t) for db, t in rows]
         self.jobs = jobs
         self.log.info('plan', '%d object(s) to drop on the TARGET cluster (parallel=%d)%s' % (
             len(jobs), self.parallel, ', then database(s): %s' % ', '.join(drop_dbs) if drop_dbs else ''))
+        existing = self.existing_target_tables(jobs)
+        here = []
+        for j in jobs:
+            if j.table.lower() in {t.lower() for t in existing.get(j.tgt_db, set())}:
+                here.append(j)
+            else:
+                j.status = 'DROPPED'
+                j.messages.append('not on target (nothing to drop)')
+                self.log.info(j.src, '=> DROPPED not on target (nothing to drop)')
+        batches = [here[i:i + self.meta_batch] for i in range(0, len(here), self.meta_batch)]
         with ThreadPoolExecutor(self.parallel) as ex:
-            list(ex.map(self.drop_table, jobs))
+            removed = [p for r in ex.map(self._drop_batch, batches) for p in r]
+        if removed:
+            db_locs = {}
+            dbs = sorted({db for db, _ in removed})
+            stmts = []
+            for i, db in enumerate(dbs):
+                stmts += [marker('DB%d' % i), 'DESCRIBE DATABASE `%s`' % db]
+            try:
+                got = split_marked(self.tgt.run('drop', stmts, retry=True, force=True))
+                for i, db in enumerate(dbs):
+                    for line in got.get('DB%d' % i, []):
+                        loc = next((f.strip() for f in line.split('\t') if re.match(r'^[A-Za-z][\w+.-]*://|^/', f.strip())), None)
+                        if loc:
+                            db_locs[db] = strip_uri(loc).rstrip('/')
+            except CommandError as e:   # unknown db location: then *.db dirs and top levels still stop it
+                self.log.info('drop', 'database locations unknown (%s)' % str(e)[:100])
+            self._remove_empty_parents_many(removed, db_locs)
         for db in drop_dbs:   # only if empty (no CASCADE): tables not listed here are never dropped
             if STOP_NEW.is_set():
                 break
