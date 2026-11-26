@@ -96,3 +96,10 @@ class History:
         if row and row['status'] == 'OK' and row['src'] == src:
             return row['run_id']
         return None
+
+    def resumable(self, src, tgt):
+        """if_exists=resume: the run_id that kept a partly copied src -> tgt table for the next run, else None."""
+        row = self.target.get(tgt)
+        if row and row['src'] == src and 'resumable' in row['flags']:
+            return row['run_id']
+        return None

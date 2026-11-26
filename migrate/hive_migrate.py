@@ -57,12 +57,16 @@ REQUIRED = {'src': ('beeline', 'hdfs_uri'), 'tgt': ('beeline', 'hadoop')}
 DEFAULTS = {
     'tgt': {'hdfs_uri': ''},              # runs on the target cluster -> its default FS
     'distcp': {'command': '',             # '' -> "<tgt hadoop> distcp"
-               'options': '-update -m 20', 'timeout': '7200'},
+               'options': '-update -m 20', 'timeout': '7200',
+               # per table, by source size: timeout = bytes / min_rate_mb MB/s x timeout_factor (at least timeout),
+               # mappers = maps_per_tb per TB (at least the -m in options, at most max_maps)
+               'min_rate_mb': '100', 'timeout_factor': '3', 'maps_per_tb': '20', 'max_maps': '200'},
     'staging': {'db': 'zz_migration_stage'},
     'result': {'db': 'migration_meta', 'table': 'migration_result'},
     'inventory': {'batch_size': '200', 'path_batch_size': '100'},
     'run': {'parallel': '2', 'if_exists': 'resume', 'stats': 'copy', 'validate': 'auto',
             'checksum_max_bytes': '100G', 'count_max_bytes': '1T',
+            'resume_min_bytes': '1T',   # failed/stopped tables this big keep their copied files (next run continues)
             'repair_source': 'true', 'call_timeout': '900', 'retries': '2', 'max_dynamic_partitions': '100000'},
 }
 
@@ -453,6 +457,8 @@ class Job:
         self.validated_by = None   # validation actually used: checksum | count | files | none
         self.src_bytes = None      # source table dir size / file count (plan-phase path check)
         self.tgt_files = self.tgt_bytes = None   # target dir after the copy (files validation)
+        self.copy_to = None        # target dir distcp writes to, set once distcp has started
+        self.action = None         # new | replace | continue (see Migrator._action)
         self.flags = set()         # result CSV `flags`: rolled_back, rollback_failed, resumable (see history.py)
 
     @property
@@ -506,8 +512,17 @@ class Migrator:
         try:   # validate=auto: checksum below the first size, row count below the second, file level above
             self.checksum_max = parse_size(r.get('checksum_max_bytes', '100G'))
             self.count_max = parse_size(r.get('count_max_bytes', '1T'))
+            self.resume_min = parse_size(r.get('resume_min_bytes', '1T'))
         except ValueError as e:
-            raise CommandError('[run] checksum_max_bytes / count_max_bytes: %s' % e)
+            raise CommandError('[run] checksum_max_bytes / count_max_bytes / resume_min_bytes: %s' % e)
+        d = cfg['distcp']
+        try:
+            self.distcp_min_rate = float(d.get('min_rate_mb', '100')) * (1 << 20)   # bytes/s
+            self.distcp_factor = float(d.get('timeout_factor', '3'))
+            self.distcp_maps_per_tb = float(d.get('maps_per_tb', '20'))
+            self.distcp_max_maps = int(d.get('max_maps', '200'))
+        except ValueError as e:
+            raise CommandError('[distcp] min_rate_mb / timeout_factor / maps_per_tb / max_maps: %s' % e)
         self.repair_source = r.getboolean('repair_source', True)
         self.parallel = r.getint('parallel', 2)
         self.meta_batch = r.getint('meta_batch', 50)      # tables per beeline session in the plan phase
@@ -739,7 +754,7 @@ class Migrator:
             j.src_dirs, j.src_bytes = (info[0], info[2]) if info else (None, None)
             if j.tgt_check and (self.tgt_uri + j.tgt_check) in counts:
                 j.tgt_pre = {'path': j.tgt_check, 'files': counts[self.tgt_uri + j.tgt_check]}
-            replace = self._action(j, existing)[0] == 'replace'
+            replace = self._action(j, existing)[0] in ('replace', 'continue')   # target dir holds our files
             # fast path: source dir has no files (0 rows for sure), not partitioned (partition dirs may live
             # elsewhere and must be registered), and no old files at an explicit target path to clean up
             stale = j.tgt_loc and (not j.tgt_pre or j.tgt_pre['files'])
@@ -836,20 +851,42 @@ class Migrator:
                     raise
                 self.log.info(who, '%s %s - running the count again' % (side.name, e))
 
-    def _distcp(self, job, src_path, tgt_path, replace):
-        opts = list(self.distcp_opts)
-        if replace and '-delete' not in opts:
-            opts.append('-delete')   # mirror: drop leftover files of the replaced table
+    def distcp_plan(self, opts, nbytes):
+        """(options, timeout) for one table of nbytes (None = unknown -> the configured values).
+        A fixed timeout fails every big table (10 TB at 1 GB/s is ~3 hours); a fixed -m makes them slow."""
+        opts, timeout = list(opts), self.distcp_timeout
+        if not nbytes:
+            return opts, timeout
+        timeout = max(timeout, int(nbytes / self.distcp_min_rate * self.distcp_factor))
+        want = int(-(-nbytes * self.distcp_maps_per_tb // (1 << 40)))   # ceil
+        if '-m' in opts and opts.index('-m') + 1 < len(opts) and opts[opts.index('-m') + 1].isdigit():
+            i = opts.index('-m') + 1
+            opts[i] = str(max(int(opts[i]), min(want, self.distcp_max_maps)))
+        elif want > 20:   # distcp's own default is 20 maps
+            opts += ['-m', str(min(want, self.distcp_max_maps))]
+        return opts, timeout
+
+    def _distcp(self, job, src_path, tgt_path, mirror):
+        """mirror: also -delete (replace / continue: the target dir must end up exactly like the source,
+        without old files or the .distcp.tmp files an aborted copy leaves behind)."""
+        opts, timeout = self.distcp_plan(self.distcp_opts, job.src_bytes)
+        if mirror and '-delete' not in opts:
+            opts.append('-delete')
         check_stop()
         # job name lets a stop request find and kill this run's distcp jobs on YARN
         name = '-Dmapreduce.job.name=%s %s' % (self.yarn_tag, job.src)
         args = self.distcp_cmd + [name] + opts + [self.src_uri + src_path, self.tgt_uri + tgt_path]
         self.distcp_started = True
-        self.log.info(job.src, 'distcp %s -> %s' % (src_path, tgt_path))
+        job.copy_to = tgt_path
+        self.log.info(job.src, 'distcp %s -> %s (%s, timeout %ds)' % (
+            src_path, tgt_path, ' '.join(o for o in opts if o != '-update'), timeout))
         self.log.debug(job.src, 'DISTCP> %s' % ' '.join(args))
-        rc, out, err = _run(args, self.distcp_timeout)
+        rc, out, err = _run(args, timeout)
         if rc != 0:
             check_stop()
+            if rc == -1:   # only the client was killed: the MapReduce job on YARN would go on copying
+                self.kill_yarn_jobs(job)
+                raise CommandError('distcp timeout after %ds' % timeout)
             raise CommandError('distcp failed (rc=%d): %s' % (rc, _error_text(out, err)))
 
     def _stats_stmts(self, job, fq):
@@ -900,16 +937,19 @@ class Migrator:
             return 'skip', 'already on target (if_exists=skip)'
         if self.if_exists == 'fail':
             return 'fail', 'already on target (if_exists=fail)'
-        if self.if_exists == 'resume':
-            run = self.history.done_ok(job.src, job.tgt) if self.history else None
+        if self.if_exists == 'resume' and self.history:
+            run = self.history.done_ok(job.src, job.tgt)
             if run:
                 return 'skip', 'already OK (run %s)' % run
+            run = self.history.resumable(job.src, job.tgt)
+            if run:
+                return 'continue', 'continuing the copy kept by run %s' % run
         return 'replace', None
 
     def skip_done(self, objs, existing):
         """Plan phase: settle the objects that are not migrated in this run (skip / fail because the target
         exists), so they cost no path checks and no worker. Returns the objects that still have to run."""
-        rest, n = [], {'skip': 0, 'fail': 0, 'replace': 0}
+        rest, n = [], {'skip': 0, 'fail': 0, 'replace': 0, 'continue': 0}
         for j in objs:
             act, msg = self._action(j, existing)
             if act in n:
@@ -920,8 +960,8 @@ class Migrator:
             else:
                 rest.append(j)
         if any(n.values()):
-            self.log.info('plan', 'already on target (if_exists=%s): %d skipped, %d failed, %d to re-create'
-                          % (self.if_exists, n['skip'], n['fail'], n['replace']))
+            self.log.info('plan', 'already on target (if_exists=%s): %d skipped, %d failed, %d to re-create, '
+                          '%d to continue' % (self.if_exists, n['skip'], n['fail'], n['replace'], n['continue']))
         return rest
 
     # ---------------------------------------------------------------- one table
@@ -942,12 +982,37 @@ class Migrator:
         except Exception as e:  # keep going with the other tables
             job.fail('STOPPED' if STOP_NOW.is_set() else 'FAILED', '%s: %s' % (type(e).__name__, e))
         if job.status in ('FAILED', 'STOPPED'):
-            if job.created:
+            if job.created and self._resumable(job):
+                self._keep_for_resume(job)
+            elif job.created:
                 self._rollback(job)
             elif job.kind == 'ACID' and not self.dry:   # failed before the target table existed
                 self._drop_source_stage(job)
         job.seconds = time.time() - t0
         self.log.info(job.src, '=> %s %s' % (job.status, '; '.join(job.messages)))
+
+    def _resumable(self, job):
+        """A big table whose copy had started keeps what it copied: the next resume run continues it
+        (distcp -update copies only the missing files) instead of copying terabytes again.
+        ACID never: what was copied is the staging table, not the table."""
+        if job.action == 'continue':   # kept before: never throw away what earlier runs copied
+            return True
+        return (job.kind != 'ACID' and job.copy_to is not None and job.src_bytes is not None
+                and job.src_bytes >= self.resume_min)
+
+    def _keep_for_resume(self, job):
+        n, path = None, job.copy_to or job.tgt_loc
+        if path:
+            try:
+                rc, out, err = self.tgt_fs.run(job.src, ['fs', '-count', self.tgt_uri + path], force=True)
+                f = out.split()
+                n = f[1] if rc == 0 and len(f) >= 4 else None
+            except CommandError:
+                pass
+        job.flags.add('resumable')
+        job.messages.append('resumable (kept %s file(s)%s; the next resume run continues the copy)'
+                            % ('?' if n is None else n, ' in %s' % path if path else ''))
+        self.log.info(job.src, 'kept %s on target for the next run (not rolled back)' % job.tgt)
 
     def _rollback(self, job):
         """A table that failed half-way must not stay on the target: the next run with
@@ -985,20 +1050,24 @@ class Migrator:
             job.messages.append('source staging table not dropped: %s' % e)
             self.log.info(job.src, 'could not drop source staging table: %s' % e)
 
-    def kill_yarn_jobs(self):
-        """After a hard stop: distcp jobs already submitted to YARN keep running without their client."""
+    def kill_yarn_jobs(self, job=None):
+        """After a hard stop (all of this run's distcp jobs) or a distcp timeout (job: that table's only):
+        distcp jobs already submitted to YARN keep running without their client."""
         if not (self.distcp_started and self.yarn_cmd):
             return
+        name = re.compile(re.escape('%s %s' % (self.yarn_tag, job.src)) + r'(?![\w.])') if job else None
         rc, out, err = _run(self.yarn_cmd + ['application', '-list', '-appStates', 'NEW,NEW_SAVING,SUBMITTED,ACCEPTED,RUNNING'], 120)
         if rc != 0:
             self.log.info('stop', 'could not list YARN applications (rc=%s): %s' % (rc, _error_text(out, err)))
             return
-        apps = [l.split()[0] for l in out.splitlines() if l.startswith('application_') and self.yarn_tag in l]
+        who = job.src if job else 'stop'
+        apps = [l.split()[0] for l in out.splitlines() if l.startswith('application_') and self.yarn_tag in l
+                and (name is None or name.search(l))]
         for app in apps:
             rc, out, err = _run(self.yarn_cmd + ['application', '-kill', app], 120)
-            self.log.info('stop', 'yarn kill %s: %s' % (app, 'ok' if rc == 0 else _error_text(out, err)))
+            self.log.info(who, 'yarn kill %s: %s' % (app, 'ok' if rc == 0 else _error_text(out, err)))
         if not apps:
-            self.log.info('stop', 'no running distcp job of this run on YARN')
+            self.log.info(who, 'no running distcp job of this %s on YARN' % ('table' if job else 'run'))
 
     def _migrate_empty(self, job, replace, tgt_loc, new_ddl, fq_tgt):
         """Source table dir has no files -> 0 rows for sure. One target session: create, set exact
@@ -1042,7 +1111,10 @@ class Migrator:
         if act in ('skip', 'fail'):
             job.fail('SKIPPED' if act == 'skip' else 'FAILED', msg)
             return
-        replace = act == 'replace'
+        job.action = act
+        replace = act in ('replace', 'continue')   # the target dir may hold files: no empty check, distcp mirrors
+        if act == 'continue':
+            job.messages.append(msg)
 
         src_path = strip_uri(m['location'])
         # same path on the target cluster for external / custom paths (db part renamed); None = warehouse
@@ -1055,7 +1127,7 @@ class Migrator:
         if self.dry:
             self.log.info(job.src, 'DRY-RUN kind=%s partitioned=%s size=%s validate=%s%s -> %s%s\n%s' % (
                 job.kind, job.partitioned, '?' if job.src_bytes is None else job.src_bytes, job.validated_by,
-                ' (empty, fast path)' if job.fast else '', job.tgt, ' (REPLACE)' if replace else '', new_ddl))
+                ' (empty, fast path)' if job.fast else '', job.tgt, ' (%s)' % act.upper() if replace else '', new_ddl))
             job.status = 'DRY-RUN'
             return
 
@@ -1161,15 +1233,16 @@ class Migrator:
                 raise CommandError('target path %s already holds %d file(s); '
                                    'use if_exists=replace or clean it first' % (tgt_loc, n))
 
+        cont = job.action == 'continue'   # table kept by an earlier run: no drop, no create, copy what's missing
         stmts = ['CREATE DATABASE IF NOT EXISTS `%s`' % job.tgt_db]
-        if replace:
+        if replace and not cont:
             stmts.append('DROP TABLE IF EXISTS %s' % fq_tgt)
-        stmts += [new_ddl, marker('DESC'), 'DESCRIBE FORMATTED %s' % fq_tgt]
+        stmts += ([] if cont else [new_ddl]) + [marker('DESC'), 'DESCRIBE FORMATTED %s' % fq_tgt]
         if job.kind == 'ACID':
             stmts += ['CREATE DATABASE IF NOT EXISTS `%s`' % self.stage_db,
                       'DROP TABLE IF EXISTS %s PURGE' % stage, stage_ddl,
                       marker('SDESC'), 'DESCRIBE FORMATTED %s' % stage]
-        self.log.info(job.src, 'creating %s on target' % job.tgt)
+        self.log.info(job.src, '%s %s on target' % ('continuing' if cont else 'creating', job.tgt))
         job.created = {'table': fq_tgt, 'path': tgt_loc, 'stage': stage if job.kind == 'ACID' else None}
         got = split_marked(self.tgt.run(job.src, stmts))
         tgt_table_path = strip_uri(parse_describe(require(got, 'DESC')['DESC'])['location'])

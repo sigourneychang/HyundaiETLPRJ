@@ -75,7 +75,7 @@ main > .panel + .panel { margin-left: 12px; }
 .st.MISMATCH, .st.FAILED { color: var(--bad); background: var(--bad-bg); }
 .st.RUNNING { color: var(--run); background: var(--run-bg); }
 .st.PENDING, .st.QUEUED, .st.READY { color: var(--wait); background: var(--wait-bg); }
-.st.SKIPPED, .st.DRY-RUN, .st.STOPPED, .st.NOT { color: var(--warn); background: var(--warn-bg); }
+.st.SKIPPED, .st.DRY-RUN, .st.STOPPED, .st.NOT, .st.RESUMABLE { color: var(--warn); background: var(--warn-bg); }
 .st.DELQ, .st.DELETING, .st.DROPPED { color: var(--bad); background: var(--bad-bg); }
 .rename { color: var(--accent); font-weight: 600; }
 button.small.icon { padding: 0 6px; border-color: transparent; background: none; color: var(--muted); }
@@ -287,9 +287,9 @@ const S = {
   history: {}, job: null, logOffset: 0, logLines: [], logFilter: null,
   searchRows: null, wasRunning: false, tab: 'list',
 };
-const BAD = new Set(['MISMATCH', 'FAILED', 'STOPPED', 'NOT RUN', 'UNSUPPORTED']);
+const BAD = new Set(['MISMATCH', 'FAILED', 'STOPPED', 'NOT RUN', 'UNSUPPORTED', 'RESUMABLE']);
 const LABEL = { OK: 'OK', MISMATCH: '불일치', FAILED: '실패', RUNNING: '진행중', PENDING: '메타 조회 대기', READY: '이관 차례 대기', NOREC: '도구 기록 없음', WAIT: '이관 대기', DROPPED: '삭제됨', DELQ: '삭제 대기', DELETING: '삭제 중',
-  QUEUED: '실행 전', SKIPPED: '건너뜀', 'DRY-RUN': 'Dry-run', STOPPED: '중지됨', 'NOT RUN': '미실행' };
+  QUEUED: '실행 전', RESUMABLE: '이어 하기 대기', SKIPPED: '건너뜀', 'DRY-RUN': 'Dry-run', STOPPED: '중지됨', 'NOT RUN': '미실행' };
 
 // ------------------------------------------------------------------ util
 function h(tag, attrs, ...kids) {
@@ -389,6 +389,7 @@ const HELP = {
   READY: '메타데이터 조회 완료. 2단계에서는 병렬 설정 수만큼만 동시에 이관하므로, 앞 테이블이 끝나 자리가 나기를 기다립니다.',
   RUNNING: '이관 중입니다. 클릭하면 이 테이블 로그를 볼 수 있습니다.',
   QUEUED: '이관 목록에 들어 있고 아직 실행하지 않았습니다.',
+  RESUMABLE: '큰 테이블이 실패하거나 중지돼, 그때까지 복사한 파일을 대상에 남겨 두었습니다(데이터가 일부만 있음). [실패 건 목록에 추가]로 목록에 넣고 \'이어 하기\'로 실행하면 남은 파일만 복사합니다.',
   NOREC: '대상 클러스터에 있지만 이 도구로 옮긴 기록이 없는 테이블입니다 (직접 만들었거나 다른 곳에서 옮김).',
   WAIT: '지금 실행 중인 이관에 들어 있고 아직 차례가 오지 않았습니다. 차례가 되면 지우고 다시 만들기 때문에 지난 결과(OK·행 수)는 표시하지 않습니다.',
 };
@@ -545,7 +546,10 @@ function countPending(k) {
 function resultStatus(k, live) {   // 대상 이름 기준
   const l = (live || liveTargets())[k];
   if (l === 'OK' || l === 'MISMATCH' || l === 'WAIT') return l;
-  return S.history[k] ? S.history[k].status : 'NOREC';   // 대상에 있지만 이 도구로 옮긴 기록이 없음
+  const hs = S.history[k];
+  if (!hs) return 'NOREC';   // 대상에 있지만 이 도구로 옮긴 기록이 없음
+  // 큰 테이블이 실패·중지돼 복사한 파일을 남겨 둠: 다음 '이어 하기' 실행이 남은 파일만 복사
+  return (hs.flags || []).includes('resumable') && hs.status !== 'OK' ? 'RESUMABLE' : hs.status;
 }
 function srcStatus(k) { return S.srcHist[k] ? S.srcHist[k].status : null; }           // 원본 이름 기준 (지난 결과)
 // 원본 트리에 보일 상태: 이관이 돌고 있고 이번 실행에 들어간 테이블이면 지난 결과는 지우고 이번 실행 상태만
