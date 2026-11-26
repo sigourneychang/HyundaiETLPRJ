@@ -26,6 +26,7 @@ import configparser
 import csv
 import datetime
 import os
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
@@ -43,7 +44,17 @@ SIZE_BUCKETS = [(1 << 30, '< 1 GB'), (100 << 30, '1-100 GB'), (1 << 40, '100 GB-
                 (10 << 40, '1-10 TB'), (None, '>= 10 TB')]
 COLUMNS = ['db', 'table', 'kind', 'format', 'partitioned', 'partition_cols', 'partition_count',
            'num_buckets', 'location', 'location_type', 'size_bytes', 'size_gb', 'file_count',
-           'dir_count', 'stats_rows', 'stats_accurate', 'serde', 'owner', 'create_time', 'error']
+           'dir_count', 'stats_rows', 'stats_accurate', 'serde', 'owner', 'create_time',
+           'ddl_time', 'dir_mtime', 'last_change', 'error']
+RECENT_DAYS = 30   # summary: tables changed within this many days (the source should be frozen)
+
+
+def epoch_text(v):
+    """transient_lastDdlTime (epoch seconds) -> 'YYYY-MM-DD HH:MM' (local time), '' if not a number."""
+    try:
+        return datetime.datetime.fromtimestamp(int(v)).strftime('%Y-%m-%d %H:%M')
+    except (TypeError, ValueError, OverflowError, OSError):
+        return ''
 
 
 def chunks(seq, n):
@@ -157,6 +168,36 @@ class Inventory:
                     self.log.info('size', 'path batch %d/%d done' % (n, len(batches)))
         return res
 
+    def mtimes(self, paths):
+        """{path: 'YYYY-MM-DD HH:MM'}: modification time of each table directory, NameNode metadata only.
+        It changes when an entry directly under the directory is added, removed or replaced (files of an
+        unpartitioned table, partition directories) - not when files are added inside an existing
+        partition directory. `fs -stat %Y` gives epoch ms, so it is converted in the same time zone as
+        ddl_time (`fs -ls` prints in the JVM's time zone, which may differ).
+        Pass existing paths only: %n is the last path component, so lines are matched by position; a batch
+        whose output doesn't line up is read again one path at a time."""
+        res = {}
+        batches = list(chunks(sorted(set(p.rstrip('/') for p in paths if p)), self.path_batch))
+
+        def stat(batch):
+            rc, out, err = self.fs.run('mtime', ['fs', '-stat', '%Y %n'] + batch)
+            lines = [l.split(' ', 1) for l in out.split('\n') if re.match(r'^\d+ ', l)]
+            if len(lines) != len(batch) or any(n.strip() != p.rsplit('/', 1)[-1] for (_, n), p in zip(lines, batch)):
+                return None
+            return {p: epoch_text(int(ms) // 1000) for (ms, _), p in zip(lines, batch)}
+
+        def one(batch):
+            got = stat(batch)
+            if got is None:
+                got = {}
+                for p in (batch if len(batch) > 1 else []):
+                    got.update(stat([p]) or {})
+            return got
+        with ThreadPoolExecutor(self.parallel) as ex:
+            for r in ex.map(one, batches):
+                res.update(r)
+        return res
+
     # ------------------------------------------------------------ assemble
     def run(self, rows):
         tables = self.list_tables(rows)
@@ -206,7 +247,8 @@ class Inventory:
                 num_buckets='' if nb in ('', '-1') else nb, location=path, location_type=loc_type,
                 stats_rows=p.get('numRows', ''),
                 stats_accurate='"BASIC_STATS":"true"' in p.get('COLUMN_STATS_ACCURATE', ''),
-                serde=m.get('serde', ''), owner=m.get('owner', ''), create_time=m.get('createtime', ''))
+                serde=m.get('serde', ''), owner=m.get('owner', ''), create_time=m.get('createtime', ''),
+                ddl_time=epoch_text(p.get('transient_lastDdlTime')))
             records.append(rec)
 
         parted = [(r['db'], r['table']) for r in records if r['partitioned'] is True]
@@ -232,11 +274,17 @@ class Inventory:
                 continue
             r['dir_count'], r['file_count'], r['size_bytes'] = s
             r['size_gb'] = '%.3f' % (s[2] / float(1 << 30))
+
+        self.log.info('inv', 'reading modification time of the HDFS location(s)')
+        mt = self.mtimes([r['location'] for r in records if r['location'] and r['dir_count'] != ''])
+        for r in records:
+            r['dir_mtime'] = mt.get(r['location'].rstrip('/'), '') if r['location'] else ''
+            r['last_change'] = max(r['ddl_time'], r['dir_mtime'])   # same text format -> max = latest
         return records
 
 
 # ---------------------------------------------------------------- reporting
-def summarize(records):
+def summarize(records, recent_days=RECENT_DAYS, now=None):
     lines = []
     total = sum(r['size_bytes'] or 0 for r in records)
     lines.append('objects: %d   total size: %s' % (len(records), human(total)))
@@ -275,8 +323,24 @@ def summarize(records):
         for r in many:
             lines.append('  %-50s %8d partitions' % ('%s.%s' % (r['db'], r['table']), r['partition_count']))
 
+    # the source is supposed to be frozen during the migration: anything changed lately is being written to
+    since = ((now or datetime.datetime.now()) - datetime.timedelta(days=recent_days)).strftime('%Y-%m-%d %H:%M')
+    recent = [r for r in records if r.get('last_change') and r['last_change'] >= since]
+    lines.append('\nchanged in the last %d days (DDL time or directory mtime; source should be frozen): '
+                 '%d table(s)' % (recent_days, len(recent)))
+    by_db = {}
+    for r in recent:
+        n, newest = by_db.get(r['db'], (0, ''))
+        by_db[r['db']] = (n + 1, max(newest, r['last_change']))
+    for db, (n, newest) in sorted(by_db.items(), key=lambda kv: kv[1][1], reverse=True)[:30]:
+        lines.append('  %-30s %6d table(s)  newest %s' % (db, n, newest))
+    if len(by_db) > 30:
+        lines.append('  ... %d more database(s) (see CSV, last_change)' % (len(by_db) - 30))
+
+    acid = [r for r in records if r['kind'] == 'ACID']
     for title, sel in (
-            ('ACID tables (go through staging, not file copy)', [r for r in records if r['kind'] == 'ACID']),
+            ('ACID tables (source staging write needed, not file copy; total %s)'
+             % human(sum(r['size_bytes'] or 0 for r in acid)), acid),
             ('managed tables with a custom location', [r for r in records if r['location_type'] == 'custom']),
             ('errors / unsupported', [r for r in records if r['error'] or r['kind'] in ('ERROR', 'UNSUPPORTED')])):
         lines.append('\n%s: %d' % (title, len(sel)))
@@ -304,8 +368,10 @@ def write_sources(records, path, origin):
            'db,table']
     for db in sorted({r['db'] for r in ok}):
         rows = [r for r in ok if r['db'] == db]
+        last = max((r.get('last_change') or '' for r in rows), default='')
         out += ['', '# ' + '=' * 70,
-                '# %s : %d object(s), %s' % (db, len(rows), human(sum(size(r) for r in rows))),
+                '# %s : %d object(s), %s%s' % (db, len(rows), human(sum(size(r) for r in rows)),
+                                             ', last change %s' % last if last else ''),
                 '# ' + '=' * 70]
         for kind in KIND_ORDER:
             sel = sorted((r for r in rows if r['kind'] == kind), key=lambda r: r['table'])
@@ -346,6 +412,8 @@ def main():
                     '(default: next to the inventory report)')
     ap.add_argument('--batch-size', type=int, help='override [inventory] batch_size')
     ap.add_argument('--parallel', type=int, help='override [run] parallel')
+    ap.add_argument('--recent-days', type=int, default=RECENT_DAYS,
+                    help='summary: list tables changed within this many days (default %d)' % RECENT_DAYS)
     ap.add_argument('--report-dir', default='reports')
     a = ap.parse_args()
 
@@ -377,7 +445,7 @@ def main():
         w = csv.DictWriter(f, fieldnames=COLUMNS)
         w.writeheader()
         w.writerows(records)
-    summary = summarize(records)
+    summary = summarize(records, a.recent_days)
     with open(base + '_summary.txt', 'w', encoding='utf-8') as f:
         f.write(summary + '\n')
     sources_out = a.sources_out or base + '_sources.csv'
