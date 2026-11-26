@@ -220,8 +220,8 @@ button.primary.danger { background: var(--bad); border-color: var(--bad); color:
 <footer>
   <div class="bar">
     <label>대상에 이미 있으면
-      <select id="optIfExists" title="기본: 대상 테이블을 지우고(DROP) 원본에서 다시 만듭니다"><option value="replace">지우고 다시 만듦</option>
-        <option value="skip">건너뜀</option><option value="fail">실패 처리</option></select></label>
+      <select id="optIfExists" title="기본(이어 하기): 이 도구로 같은 대상에 옮겨 OK로 끝난 테이블은 건너뛰고, 그 밖에 대상에 있는 것(실패, 불일치, 도구 기록 없음)은 지우고 다시 만듭니다"><option value="resume">이어 하기 (OK는 건너뜀)</option>
+        <option value="replace">모두 지우고 다시 만듦</option><option value="skip">건너뜀</option><option value="fail">실패 처리</option></select></label>
     <label>검증
       <select id="optValidate" title="행 수 + 해시: 원본과 대상 모두 전체 데이터를 읽어 내용까지 비교 (기본)"><option value="checksum">행 수 + 해시</option><option value="count">행 수</option><option value="none">안 함</option></select></label>
     <label title="테이블·뷰를 동시에 몇 개 처리할지. 이관 실행 중에 바꾸면 몇 초 안에 반영됩니다 (줄이면 진행 중인 테이블은 끝까지 둠)">동시 처리 <input type="number" id="optParallel" min="1" max="64" value="2"></label>
@@ -522,13 +522,16 @@ $('srcKind').onchange = $('srcState').onchange = renderSource;
 // 실행 중인 이관의 실시간 상태를 대상 이름 기준으로 (결과 기록 파일은 1분마다·끝날 때 다시 읽음)
 //   OK/MISMATCH: 방금 끝남 -> 바로 결과 칸에 표시 / RUNNING: 대상 테이블을 만드는 중 -> 결과 칸에서 숨김
 //   WAIT: 이번 실행에서 아직 차례가 안 옴 -> 지난 결과(OK·행 수)는 지우고 '이관 대기'로만 표시
+//         단, 이어 하기(resume)에서 같은 원본으로 OK인 테이블은 다시 만들지 않으므로 지난 결과 그대로
 function liveTargets() {
   const j = S.job, live = {};
   if (!(j && j.running && j.kind === 'migrate' && j.items)) return live;
   for (const [sk, st] of Object.entries(j.items)) {
-    const v = st === 'PENDING' || st === 'READY' ? 'WAIT' : st;
+    const [sdb, t] = split(sk), tk = key(tgtDbOf(sdb), t), hs = S.history[tk];
+    const kept = j.if_exists === 'resume' && hs && hs.status === 'OK' && hs.src === sk;
+    const v = st === 'PENDING' || st === 'READY' ? (kept ? null : 'WAIT') : st;
     if (v !== 'OK' && v !== 'MISMATCH' && v !== 'RUNNING' && v !== 'WAIT') continue;
-    const [sdb, t] = split(sk); live[key(tgtDbOf(sdb), t)] = v;
+    live[tk] = v;
   }
   return live;
 }
@@ -820,10 +823,11 @@ $('btnRetry').onclick = () => {
   const badT = bad.map(k => S.srcHist[k].tgt || k);
   if (!bad.length) return toast('실패한 테이블이 없습니다');
   const n = addToQueue(bad);
-  // 불일치(MISMATCH) 테이블은 대상에 남아 있어서 '건너뜀'이면 다시 건너뛴다
+  // 불일치(MISMATCH) 테이블은 대상에 남아 있어서 '건너뜀'이면 다시 건너뛴다 -> '이어 하기'(OK가 아닌 것은 다시 만듦)
   const mism = bad.some(k => srcStatus(k) === 'MISMATCH') || badT.some(k => k in S.history);
-  if (mism && $('optIfExists').value === 'skip') $('optIfExists').value = 'replace';
-  toast(`실패 건 ${n}개를 이관 목록에 추가했습니다` + (mism ? ". 불일치 테이블은 대상에 남아 있어 '지우고 다시 만듦'으로 바꿨습니다" : ''));
+  const sw = mism && $('optIfExists').value === 'skip';
+  if (sw) $('optIfExists').value = 'resume';
+  toast(`실패 건 ${n}개를 이관 목록에 추가했습니다` + (sw ? ". 불일치 테이블은 대상에 남아 있어 '이어 하기'로 바꿨습니다" : ''));
   renderSource(); renderTarget();
 };
 $('btnExport').onclick = () => {
@@ -868,7 +872,8 @@ async function run(dry) {
               `검증: ${$('optValidate').selectedOptions[0].text}\n동시 처리: ${o.parallel}개\n원본 0행이면 MSCK 복구: ${o.repair_source ? '예' : '아니오'}`;
     const ren = [...new Set(S.queue.map(k => split(k)[0]))].filter(db => tgtDbOf(db) !== db);
     if (ren.length) msg += '\n\nDB 이름 바꾸기 (external 경로의 DB 이름도 바뀜):\n' + ren.map(db => `  ${db} → ${tgtDbOf(db)}`).join('\n');
-    if (o.if_exists === 'replace') msg += '\n\n※ 대상에 이미 있는 테이블은 지우고(데이터 포함) 원본에서 다시 만듭니다.';
+    if (o.if_exists === 'replace') msg += '\n\n※ 대상에 이미 있는 테이블은 OK였던 것도 모두 지우고(데이터 포함) 원본에서 다시 만듭니다.';
+    if (o.if_exists === 'resume') msg += '\n\n※ 같은 대상으로 OK였던 테이블은 건너뜁니다. 대상에 있는 그 밖의 테이블(실패, 불일치, 도구 기록 없음)은 지우고 다시 만듭니다.';
     if (!await ask({ title: '이관 실행', body: msg, ok: '이관 실행' })) return;
   }
   try {

@@ -38,6 +38,9 @@ import time
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from history import History  # noqa: E402  (result CSV history, shared with the web UI)
+
 # Table properties that must not be carried over in the DDL (stats are handled separately).
 DROP_PROPS = {
     'transient_lastDdlTime', 'last_modified_by', 'last_modified_time',
@@ -58,7 +61,7 @@ DEFAULTS = {
     'staging': {'db': 'zz_migration_stage'},
     'result': {'db': 'migration_meta', 'table': 'migration_result'},
     'inventory': {'batch_size': '200', 'path_batch_size': '100'},
-    'run': {'parallel': '2', 'if_exists': 'replace', 'stats': 'copy', 'validate': 'checksum',
+    'run': {'parallel': '2', 'if_exists': 'resume', 'stats': 'copy', 'validate': 'checksum',
             'repair_source': 'true', 'call_timeout': '900', 'retries': '2', 'max_dynamic_partitions': '100000'},
 }
 
@@ -433,6 +436,7 @@ class Job:
         self.src_files = None      # file count under the source table dir (plan-phase precheck), -1 = not checked
         self.tgt_pre = None        # plan-phase precheck of the target dir: {'path': p, 'files': n or None}
         self.fast = False          # empty source table: create + stats only (no count jobs, no distcp)
+        self.flags = set()         # result CSV `flags`: rolled_back, rollback_failed, resumable (see history.py)
 
     @property
     def src(self):
@@ -458,8 +462,12 @@ class Job:
 
 # --------------------------------------------------------------------------- migrator
 class Migrator:
-    def __init__(self, cfg, log, dry_run, run_id='manual'):
+    def __init__(self, cfg, log, dry_run, run_id='manual', report_dir=None):
         self.cfg, self.log, self.dry, self.run_id = cfg, log, dry_run, run_id
+        # if_exists=resume reads past results once, before this run writes its own CSV
+        self.history = History(report_dir) if report_dir else None
+        if self.history:
+            self.history.load()
         self.control_path, self._control_mtime = None, None   # see _control_parallel
         self.yarn_cmd = shlex.split(cfg['tgt'].get('yarn', ''))
         self.distcp_started = False
@@ -706,7 +714,7 @@ class Migrator:
             j.src_dirs, j.src_bytes = (info[0], info[2]) if info else (None, None)
             if j.tgt_check and (self.tgt_uri + j.tgt_check) in counts:
                 j.tgt_pre = {'path': j.tgt_check, 'files': counts[self.tgt_uri + j.tgt_check]}
-            replace = j.table in existing.get(j.tgt_db, set()) and self.if_exists == 'replace'
+            replace = self._action(j, existing)[0] == 'replace'
             # fast path: source dir has no files (0 rows for sure), not partitioned (partition dirs may live
             # elsewhere and must be registered), and no old files at an explicit target path to clean up
             stale = j.tgt_loc and (not j.tgt_pre or j.tgt_pre['files'])
@@ -830,6 +838,41 @@ class Migrator:
             self.log.info(job.src, 'source MSCK REPAIR found nothing to add (table is really empty)')
         return added > 0
 
+    # ---------------------------------------------------------------- target already there?
+    def _action(self, job, existing):
+        """What to do with the target object: ('new'|'replace'|'skip'|'fail', message).
+        resume: skip only when the last result for this source -> target is OK (history) and the object is
+        on the target; anything else that is on the target (failed, mismatch, not made by this tool) is replaced."""
+        if job.table not in existing.get(job.tgt_db, set()):
+            return 'new', None
+        if self.if_exists == 'skip':   # (decided before the source metadata is read: kind not known yet)
+            return 'skip', 'already on target (if_exists=skip)'
+        if self.if_exists == 'fail':
+            return 'fail', 'already on target (if_exists=fail)'
+        if self.if_exists == 'resume':
+            run = self.history.done_ok(job.src, job.tgt) if self.history else None
+            if run:
+                return 'skip', 'already OK (run %s)' % run
+        return 'replace', None
+
+    def skip_done(self, objs, existing):
+        """Plan phase: settle the objects that are not migrated in this run (skip / fail because the target
+        exists), so they cost no path checks and no worker. Returns the objects that still have to run."""
+        rest, n = [], {'skip': 0, 'fail': 0, 'replace': 0}
+        for j in objs:
+            act, msg = self._action(j, existing)
+            if act in n:
+                n[act] += 1
+            if act in ('skip', 'fail'):
+                j.fail('SKIPPED' if act == 'skip' else 'FAILED', msg)
+                self.log.info(j.src, '=> %s %s' % (j.status, msg))
+            else:
+                rest.append(j)
+        if any(n.values()):
+            self.log.info('plan', 'already on target (if_exists=%s): %d skipped, %d failed, %d to re-create'
+                          % (self.if_exists, n['skip'], n['fail'], n['replace']))
+        return rest
+
     # ---------------------------------------------------------------- one table
     @property
     def yarn_tag(self):
@@ -873,9 +916,11 @@ class Migrator:
             if c.get('stage'):
                 self._drop_source_stage(job)
             job.messages.append('rolled back (target table%s removed)' % (' and files' if c.get('path') else ''))
+            job.flags.add('rolled_back')
             self.log.info(job.src, 'rolled back: dropped %s on target' % job.tgt)
         except CommandError as e:
             job.messages.append('ROLLBACK FAILED, clean up by hand: %s' % e)
+            job.flags.add('rollback_failed')
             self.log.info(job.src, 'ROLLBACK FAILED: %s' % e)
 
     def _stage_name(self, job):
@@ -942,14 +987,11 @@ class Migrator:
 
     def _migrate_table(self, job, existing):
         m = job.meta
-        exists = job.table in existing.get(job.tgt_db, set())
-        if exists and self.if_exists == 'skip':
-            job.fail('SKIPPED', 'target table already exists (if_exists=skip)')
+        act, msg = self._action(job, existing)
+        if act in ('skip', 'fail'):
+            job.fail('SKIPPED' if act == 'skip' else 'FAILED', msg)
             return
-        if exists and self.if_exists == 'fail':
-            job.fail('FAILED', 'target table already exists (if_exists=fail)')
-            return
-        replace = exists and self.if_exists == 'replace'
+        replace = act == 'replace'
 
         src_path = strip_uri(m['location'])
         # same path on the target cluster for external / custom paths (db part renamed); None = warehouse
@@ -1108,13 +1150,11 @@ class Migrator:
     def migrate_view(self, job, existing):
         t0 = time.time()
         try:
-            exists = job.table in existing.get(job.tgt_db, set())
-            if exists and self.if_exists == 'skip':
-                job.fail('SKIPPED', 'target view already exists (if_exists=skip)')
+            act, msg = self._action(job, existing)
+            if act in ('skip', 'fail'):
+                job.fail('SKIPPED' if act == 'skip' else 'FAILED', msg)
                 return True
-            if exists and self.if_exists == 'fail':
-                job.fail('FAILED', 'target view already exists (if_exists=fail)')
-                return True
+            exists = act == 'replace'
             ddl = rewrite_view_ddl(job.ddl, job.src_db, job.tgt_db, job.table, getattr(self, 'db_map', None))
             if self.dry:
                 self.log.info(job.src, 'DRY-RUN kind=VIEW -> %s\n%s' % (job.tgt, ddl))
@@ -1374,20 +1414,23 @@ class Migrator:
         jobs = self.expand_targets(rows)
         jobs = [j for j in jobs if j.src_db not in (self.stage_db, self.result_db)]
         self.jobs = jobs   # the periodic report writer reads this
-        self.log.info('plan', '%d object(s) to migrate, reading source metadata (parallel=%d)'
-                      % (len(jobs), self.parallel))
-        self.load_meta_batched(jobs)
+        # target first: objects settled by if_exists (e.g. resume: already OK) need no source metadata read
         existing = self.existing_target_tables(jobs)
+        todo = self.skip_done(jobs, existing)
+        self.log.info('plan', '%d object(s) to migrate, reading source metadata (parallel=%d)'
+                      % (len(todo), self.parallel))
+        self.load_meta_batched(todo)
 
-        tables = [j for j in jobs if j.kind in ('EXTERNAL', 'MANAGED', 'ACID')]
-        views = [j for j in jobs if j.kind == 'VIEW']
-        for j in jobs:
+        tables = [j for j in todo if j.kind in ('EXTERNAL', 'MANAGED', 'ACID')]
+        views = [j for j in todo if j.kind == 'VIEW']
+        for j in todo:
             if j.kind == 'UNSUPPORTED' and j.status == 'PENDING':
                 j.fail('UNSUPPORTED', 'unknown table type')
         self.precheck_paths(tables, existing)   # still plan phase (the web UI switches phase on the next line)
-        self.log.info('plan', 'tables=%d (external=%d managed=%d acid=%d) views=%d unsupported/failed=%d' % (
+        skipped = sum(j.status == 'SKIPPED' for j in jobs)
+        self.log.info('plan', 'tables=%d (external=%d managed=%d acid=%d) views=%d unsupported/failed=%d skipped=%d' % (
             len(tables), sum(j.kind == 'EXTERNAL' for j in tables), sum(j.kind == 'MANAGED' for j in tables),
-            sum(j.kind == 'ACID' for j in tables), len(views), len(jobs) - len(tables) - len(views)))
+            sum(j.kind == 'ACID' for j in tables), len(views), len(jobs) - len(tables) - len(views) - skipped, skipped))
 
         self._run_objects(tables, views, existing)
         if STOP_NOW.is_set():
@@ -1427,13 +1470,13 @@ def write_report(path, jobs):
         w = csv.writer(f)
         w.writerow(['src', 'tgt', 'kind', 'partitioned', 'status', 'src_rows', 'tgt_rows',
                     'tgt_count_star', 'src_checksum', 'tgt_checksum', 'src_partitions',
-                    'tgt_partitions', 'seconds', 'message'])
+                    'tgt_partitions', 'seconds', 'message', 'flags'])
         for j in jobs:
             w.writerow([j.src, j.tgt, j.kind, j.partitioned, j.status, j.src_rows, j.tgt_rows,
                         j.tgt_stats_rows, j.src_sum, j.tgt_sum,
                         len(j.src_parts) if j.src_parts is not None else '',
                         len(j.tgt_parts) if j.tgt_parts is not None else '',
-                        '%.1f' % j.seconds, '; '.join(j.messages)])
+                        '%.1f' % j.seconds, '; '.join(j.messages), ';'.join(sorted(j.flags))])
     os.replace(tmp, path)
 
 
@@ -1475,8 +1518,9 @@ def main():
     ap.add_argument('--small-parallel', type=int, help=argparse.SUPPRESS)   # removed; accepted and ignored
     ap.add_argument('--control', help='JSON file {"parallel": N}; re-read while running, so the number of '
                                       'tables/views at a time can be changed without restarting')
-    ap.add_argument('--if-exists', choices=['replace', 'skip', 'fail'],
-                    help='override [run] if_exists (default replace: drop and re-create)')
+    ap.add_argument('--if-exists', choices=['resume', 'replace', 'skip', 'fail'],
+                    help='override [run] if_exists (default resume: skip what the last run of the same '
+                         'source -> target finished OK, drop and re-create anything else on the target)')
     ap.add_argument('--validate', choices=['checksum', 'count', 'none'],
                     help='override [run] validate (default checksum: row count + sum(hash(*)))')
     ap.add_argument('--repair-source', choices=['true', 'false'], help='override [run] repair_source')
@@ -1528,7 +1572,7 @@ def main():
                              '(found %s). List the target names in the db column.' % ', '.join(renamed[:5]))
         rows = [(d, t) for d, t, _ in rows]
     try:
-        migrator = Migrator(cfg, log, a.dry_run, run_id)
+        migrator = Migrator(cfg, log, a.dry_run, run_id, a.report_dir)
         migrator.control_path = a.control
         flusher = start_report_flusher(base + '.csv', migrator)
         jobs = migrator.drop_targets(rows, [d for d in a.drop_databases.split(',') if d]) \

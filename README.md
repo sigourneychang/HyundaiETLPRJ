@@ -12,6 +12,7 @@ DB 전체나 테이블 단위로 옮기고, 옮긴 뒤 원본과 대상의 행 �
 | 경로 | 내용 |
 |---|---|
 | `migrate/hive_migrate.py` | 이관 CLI. 메타 조회, DDL 재작성, distcp 복사, 검증, 실패 시 되돌리기, 대상 삭제 |
+| `migrate/history.py` | 결과 CSV 이력. 이어 하기(resume) 판단과 웹 화면 상태에 함께 씀 |
 | `migrate/hive_inventory.py` | 원본 인벤토리(읽기 전용). 테이블 종류, 형식, 파티션, 크기를 CSV로 남김 |
 | `migrate/web_ui.py`, `migrate/web/index.html` | 웹 화면 (원본 \| 이관 목록 \| 이관 결과) |
 | `conf/local.ini` | 설정 예시 (로컬 Docker 테스트 환경용) |
@@ -40,7 +41,7 @@ python3 migrate/web_ui.py -c conf/prod.ini
 |---|---|---|
 | `--parallel N` | 2 | 동시에 처리할 테이블 수 |
 | `--control FILE` | 없음 | JSON `{"parallel": N}` 파일. 실행 중에 고치면 몇 초 안에 반영 |
-| `--if-exists` | `replace` | 대상에 이미 있을 때: 지우고 다시 만듦 / 건너뜀(`skip`) / 실패(`fail`) |
+| `--if-exists` | `resume` | 대상에 이미 있을 때: 같은 원본에서 OK로 옮긴 것은 건너뛰고 나머지는 다시 만듦 / 모두 다시 만듦(`replace`) / 건너뜀(`skip`) / 실패(`fail`) |
 | `--validate` | `checksum` | `count(1)` + `sum(hash(*))` 비교. `count`는 행 수만, `none`은 검증 안 함 |
 | `--repair-source` | `true` | 원본 행 수가 0인 파티션 테이블은 원본에서 MSCK REPAIR 실행 |
 | `--drop-target` | | 이관 대신 목록의 대상 테이블을 삭제 (`--drop-databases`로 빈 DB도 삭제) |

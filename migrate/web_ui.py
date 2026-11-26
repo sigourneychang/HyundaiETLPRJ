@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hive_migrate as hm   # 설정 읽기, beeline 실행 (대상 DB 목록 조회)
+from history import History   # 이관 이력 (결과 CSV): CLI의 resume 과 같은 규칙
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOOT_ID = datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')   # 서버가 재시작되면 바뀜 -> 화면이 새로고침
@@ -118,70 +119,6 @@ def _int(v):
         return None
 
 
-# --------------------------------------------------------------------------- 이관 이력 (오른쪽 상태)
-class History:
-    """reports/migration_*.csv (dry-run 제외)를 시간 순서로 읽어 두 가지를 만든다.
-
-    target   : 대상 'db.table' -> 대상 클러스터에 지금 있는 테이블의 마지막 상태 (이관 결과 칸)
-               OK / MISMATCH(양쪽에 있는데 검증 불일치) 만 들어감. 삭제(DROPPED)·되돌린 실패는 빠지고,
-               테이블을 만들기 전에 실패한 기록은 대상 상태를 바꾸지 않음(이전에 옮긴 테이블이 그대로 있음).
-               예외: 되돌리기 실패(ROLLBACK FAILED)는 대상에 반쯤 만든 테이블이 남았으므로 FAILED 로 남김.
-    attempts : 원본 'db.table' -> 마지막 시도 결과 (실패 포함, 원본 트리·이관 목록의 '지난 결과')
-    """
-
-    def __init__(self, report_dir):
-        self.report_dir = report_dir
-        self.lock = threading.Lock()
-        self.seen = {}      # path -> mtime
-        self.target, self.attempts, self.tgt2src = {}, {}, {}
-
-    @staticmethod
-    def _apply(target, attempts, tgt2src, r, run_id):
-        src, tgt, st, msg = r['src'], (r.get('tgt') or r['src']), r['status'], r.get('message', '')
-        row = {'src': src, 'tgt': tgt, 'status': st, 'kind': r['kind'], 'src_rows': r['src_rows'],
-               'tgt_rows': r['tgt_rows'], 'message': msg, 'run_id': run_id}
-        not_started = st == 'STOPPED' and msg.startswith('not started')
-        if st == 'DROPPED':   # 대상 삭제는 이관 시도가 아님: 그 대상으로 옮겼던 원본은 '이관 안 됨'으로 돌아감
-            s0 = tgt2src.pop(tgt, None)
-            if s0 and attempts.get(s0, {}).get('tgt') == tgt:
-                attempts.pop(s0, None)
-        # 마지막 시도 (건너뜀·시작 전 중지는 이전 시도를 덮지 않음)
-        elif not ((st == 'SKIPPED' or not_started) and src in attempts):
-            attempts[src] = row
-            tgt2src[tgt] = src
-        # 대상 상태
-        if st in ('OK', 'MISMATCH'):
-            target[tgt] = row
-        elif st == 'DROPPED' or (st in ('FAILED', 'STOPPED') and 'rolled back' in msg):
-            target.pop(tgt, None)                      # 대상에서 없어짐
-        elif 'ROLLBACK FAILED' in msg:
-            target[tgt] = row                          # 반쯤 만든 테이블이 남음
-        elif st == 'SKIPPED' and tgt not in target:
-            target[tgt] = row                          # 대상에 이미 있던 테이블
-        # 그 밖의 실패/중지/미지원: 대상 테이블을 만들기 전 -> 대상 상태 그대로
-
-    def load(self):
-        files = sorted(f for f in glob.glob(os.path.join(self.report_dir, 'migration_*.csv'))
-                       if '_dryrun' not in f)
-        with self.lock:
-            changed = [f for f in files if self.seen.get(f) != os.path.getmtime(f)]
-            if not changed:
-                return
-            if any(f in self.seen for f in changed) or (self.seen and min(changed) < max(self.seen)):
-                self.seen, self.target, self.attempts, self.tgt2src = {}, {}, {}, {}   # 순서가 바뀌면 처음부터 다시
-                changed = files
-            for f in changed:   # 파일명이 run_id 순서라 뒤에 읽은 것이 최신
-                run_id = os.path.basename(f)[len('migration_'):-len('.csv')]
-                with open(f, newline='', encoding='utf-8') as fh:
-                    for r in csv.DictReader(fh):
-                        self._apply(self.target, self.attempts, self.tgt2src, r, run_id)
-                self.seen[f] = os.path.getmtime(f)
-
-    def all(self):
-        self.load()
-        return {'target': self.target, 'attempts': self.attempts}
-
-
 # --------------------------------------------------------------------------- 백그라운드 작업
 def keep_awake(pid):
     """macOS: 작업 프로세스가 끝날 때까지 자동 잠자기를 막음 (caffeinate -i -w PID, 작업이 끝나면 저절로 풀림).
@@ -261,6 +198,7 @@ class JobRunner:
         self.pid, self.out_path, self.kind = info['pid'], info['out'], info['kind']
         self.started = datetime.datetime.strptime(info['started'], '%Y-%m-%d %H:%M:%S')
         self.dry_run, self.parallel = info.get('dry_run', False), info.get('parallel')
+        self.if_exists = info.get('if_exists')
         self.items = {k: 'PENDING' for k in info.get('items', [])}
         self.phase = info.get('phase')
         self.adopted = True
@@ -268,10 +206,14 @@ class JobRunner:
         self.lines = ['*** 웹 서버 재시작: 실행 중인 작업(pid %d)을 이어받았습니다 ***' % self.pid]
         threading.Thread(target=self._pump, daemon=True).start()
 
-    def _start(self, kind, args, items=None, dry_run=False, phase='plan'):
+    def _start(self, kind, args, items=None, dry_run=False, phase='plan', parallel=None, if_exists=None):
         with self.lock:
             if self.running():
                 raise ValueError('이미 실행 중인 작업이 있습니다 (%s)' % self.kind)
+            # 실행 중인 작업이 없을 때만 바꿈 (확인 전에 바꾸면 거절된 요청이 실행 중인 작업의 값을 덮어씀)
+            self.parallel, self.if_exists = parallel, if_exists
+            if parallel:   # 이전 실행이 남긴 제어 파일 값이 --parallel 을 덮지 않게, 프로세스보다 먼저 씀
+                self._write_control(int(parallel))
             env = dict(os.environ, PYTHONUNBUFFERED='1')
             stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
             self.out_path = os.path.join(self.report_dir, 'ui_job_%s.out' % stamp)
@@ -293,6 +235,7 @@ class JobRunner:
                 with open(self.pidfile, 'w', encoding='utf-8') as f:
                     json.dump({'pid': self.pid, 'kind': kind, 'out': self.out_path, 'items': list(self.items),
                                'dry_run': dry_run, 'phase': self.phase, 'parallel': getattr(self, 'parallel', None),
+                               'if_exists': getattr(self, 'if_exists', None),
                                'started': self.started.strftime('%Y-%m-%d %H:%M:%S')}, f, ensure_ascii=False)
             except OSError:
                 pass
@@ -365,8 +308,14 @@ class JobRunner:
                 self.items[who] = 'RUNNING'
 
     def _write_sources(self, items, prefix):
-        stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        path = os.path.join(self.report_dir, '%s_%s.csv' % (prefix, stamp))
+        # 실행 중이면 쓰지 않음, 이름도 실행마다 다르게: 같은 초에 들어온 (거절될) 요청이 막 시작한 작업이
+        # 읽을 목록 파일을 덮어쓰면 그 작업이 엉뚱한 목록으로 돎
+        with self.lock:
+            if self.running():
+                raise ValueError('이미 실행 중인 작업이 있습니다 (%s)' % self.kind)
+        now = datetime.datetime.now()
+        stamp = now.strftime('%Y%m%d_%H%M%S')
+        path = os.path.join(self.report_dir, '%s_%s_%06d.csv' % (prefix, stamp, now.microsecond))
         os.makedirs(self.report_dir, exist_ok=True)
         with open(path, 'w', newline='', encoding='utf-8') as f:
             f.write('# 웹 화면에서 생성 %s\n' % stamp)
@@ -386,12 +335,11 @@ class JobRunner:
                 '--if-exists', opts['if_exists'], '--validate', opts['validate'],
                 '--parallel', str(opts['parallel']), '--control', self.control,
                 '--repair-source', opts['repair_source']]
-        self._write_control(opts['parallel'])
         if opts['dry_run']:
             args.append('--dry-run')
-        self.parallel = '%d' % opts['parallel']
         self._start('dry-run' if opts['dry_run'] else 'migrate', args,
-                    ['%s.%s' % it[:2] for it in items], opts['dry_run'])
+                    ['%s.%s' % it[:2] for it in items], opts['dry_run'],
+                    parallel='%d' % opts['parallel'], if_exists=opts['if_exists'])
 
     def _write_control(self, n):
         tmp = self.control + '.tmp'
@@ -467,6 +415,7 @@ class JobRunner:
                 'lines': self.lines[start:], 'next': self.dropped + len(self.lines),
                 'items': self.items, 'total': len(vals), 'done': done,
                 'phase': self.phase, 'meta_done': meta, 'parallel': getattr(self, 'parallel', None),
+                'if_exists': getattr(self, 'if_exists', None),
             }
 
 
@@ -598,7 +547,7 @@ def make_handler(app):
                 elif p == '/api/migrate':
                     opts = {
                         'dry_run': bool(body.get('dry_run')),
-                        'if_exists': _choice(body.get('if_exists'), ('replace', 'skip', 'fail')),
+                        'if_exists': _choice(body.get('if_exists'), ('resume', 'replace', 'skip', 'fail')),
                         'validate': _choice(body.get('validate'), ('checksum', 'count', 'none')),
                         'parallel': max(1, min(int(body.get('parallel') or 2), 64)),
                         'repair_source': 'true' if body.get('repair_source', True) else 'false',
