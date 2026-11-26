@@ -287,6 +287,13 @@ const S = {
   history: {}, job: null, logOffset: 0, logLines: [], logFilter: null,
   searchRows: null, wasRunning: false, tab: 'list',
 };
+// 상태 개수 칩의 순서 (고정): 처음 나온 상태 순서로 두면 테이블 하나의 상태가 바뀔 때마다 칩 순서가 뒤집힘
+const STATUS_ORDER = ['RUNNING', 'DELETING', 'READY', 'PENDING', 'DELQ', 'WAIT', 'QUEUED', 'OK', 'SKIPPED', 'DRY-RUN', 'DROPPED',
+                      'MISMATCH', 'FAILED', 'RESUMABLE', 'STOPPED', 'NOT RUN', 'UNSUPPORTED', 'NOREC'];
+function inStatusOrder(cnt) {   // {상태: 개수} -> [[상태, 개수]] 고정 순서, 모르는 상태는 맨 뒤
+  const rank = s => { const i = STATUS_ORDER.indexOf(s); return i < 0 ? STATUS_ORDER.length : i; };
+  return Object.entries(cnt).sort(([a], [b]) => rank(a) - rank(b) || (a < b ? -1 : a > b ? 1 : 0));
+}
 const BAD = new Set(['MISMATCH', 'FAILED', 'STOPPED', 'NOT RUN', 'UNSUPPORTED', 'RESUMABLE']);
 const LABEL = { OK: 'OK', MISMATCH: '불일치', FAILED: '실패', RUNNING: '진행중', PENDING: '메타 조회 대기', READY: '이관 차례 대기', NOREC: '도구 기록 없음', WAIT: '이관 대기', DROPPED: '삭제됨', DELQ: '삭제 대기', DELETING: '삭제 중',
   QUEUED: '실행 전', RESUMABLE: '이어 하기 대기', SKIPPED: '건너뜀', 'DRY-RUN': 'Dry-run', STOPPED: '중지됨', 'NOT RUN': '미실행' };
@@ -589,7 +596,7 @@ function tgtDbNode(pane, db, ks, statusOf, picked, forceOpen) {   // picked: 체
       title: pane === 'result' ? 'DB의 결과 전체 선택' : null,
       onchange: e => { for (const k of ks) e.target.checked ? picked.add(k) : picked.delete(k); renderTarget(); } }) : null,
     h('span', { class: 'name' }, db),
-    h('span', { class: 'dbsum' }, Object.entries(cnt).map(([s, n]) =>
+    h('span', { class: 'dbsum' }, inStatusOrder(cnt).map(([s, n]) =>
       h('span', { class: 'st ' + s.split(' ')[0] }, `${LABEL[s] || s} ${n}`))))];
 }
 function rowsText(k) {
@@ -627,8 +634,9 @@ function renderList() {
     const [open, node] = tgtDbNode('list', db, by[db], listStatus, S.tgtPicked, !!q); frag.append(node);
     const nameEl = node.querySelector('.name'), tdb = tgtDbOf(db);
     nameEl.replaceChildren(db, tdb !== db ? h('span', { class: 'rename', title: '대상 클러스터에서 쓸 DB 이름' }, ' → ' + tdb) : '');
-    nameEl.after(h('button', { class: 'small icon', title: '대상 DB 이름 바꾸기 (이 DB의 모든 테이블에 적용, 테이블 이름은 그대로)',
-                               onclick: () => renameDb(db) }, '✎'));
+    if (!dbInRunningJob(db))   // 실행 중인 작업에 든 DB는 이름 바꾸기 버튼을 숨김 (실행이 끝나면 다시 보임)
+      nameEl.after(h('button', { class: 'small icon', title: '대상 DB 이름 바꾸기 (이 DB의 모든 테이블에 적용, 테이블 이름은 그대로)',
+                                 onclick: () => renameDb(db) }, '✎'));
     if (!open) continue;
     for (const k of by[db]) {
       const st = listStatus(k), prev = srcStatus(k), [, t] = split(k);
@@ -823,7 +831,27 @@ function addToQueue(keys) {
   for (const k of keys) if (!S.queue.includes(k)) { S.queue.push(k); n++; }
   S.queue.sort(); saveQueue(); return n;
 }
+// 이관 목록은 브라우저마다 저장됨(localStorage): 다른 창·브라우저에서 시작한 실행이 돌고 있으면
+// 그 실행의 테이블을 목록에 넣어 진행 상태를 보여줌. 실행마다 한 번만 (실행 중 목록에서 뺀 것을 되살리지 않게)
+function adoptJobItems(j) {
+  if (!(j && j.running && (j.kind === 'migrate' || j.kind === 'dry-run') && j.items)) return;
+  const id = j.kind + j.started;
+  if (S.adoptedJob === id) return;
+  S.adoptedJob = id;
+  // 이 실행이 쓰는 대상 DB 이름 (이름을 바꾼 것만): 이 브라우저에 저장된 이름보다 실행 중인 작업의 것이 맞음
+  for (const [sdb, tdb] of Object.entries(j.db_map || {})) S.dbMap[sdb] = tdb;
+  const n = addToQueue(Object.keys(j.items));   // (목록과 함께 DB 이름 대응도 저장됨)
+  if (n) toast(`실행 중인 ${j.kind === 'dry-run' ? 'Dry-run' : '이관'}의 테이블 ${n}개를 이관 목록에 표시합니다`);
+}
+// 실행 중인 이관·dry-run에 들어 있는 원본 DB: 그 실행은 시작할 때의 대상 이름을 쓰므로 바꿔도 반영되지 않고,
+// 화면만 바뀐 이름으로 실시간 상태를 맞춰 결과 칸이 어긋남 -> 실행이 끝날 때까지 이름 바꾸기를 막음
+function dbInRunningJob(db) {
+  const j = S.job;
+  return !!(j && j.running && (j.kind === 'migrate' || j.kind === 'dry-run') && j.items &&
+            Object.keys(j.items).some(k => split(k)[0] === db));
+}
 async function renameDb(db) {
+  if (dbInRunningJob(db)) return toast(`${db}는 실행 중인 작업에 들어 있어 이름을 바꿀 수 없습니다`, true);
   const r = await ask({ title: `대상 DB 이름 바꾸기: ${db}`, ok: '적용',
     body: `이관 목록에 있는 ${db}의 모든 테이블을 대상 클러스터에서 아래 DB 이름으로 만듭니다. 테이블 이름은 그대로입니다.\n` +
           `• external 테이블과 사용자 지정 경로는 경로 중 DB 이름 부분(${db}, ${db}.db)도 새 이름으로 바뀝니다.\n` +
@@ -860,7 +888,7 @@ $('btnClear').onclick = async () => {
 $('btnRetry').onclick = () => {
   // 마지막 시도가 실패한 원본 테이블 전부 (결과 칸에 안 나오는, 테이블을 만들기 전 실패도 포함)
   const bad = Object.keys(S.srcHist).filter(k => BAD.has(srcStatus(k)) && srcStatus(k) !== 'UNSUPPORTED');
-  for (const k of bad) { const t = S.srcHist[k].tgt, sdb = split(k)[0], tdb = t ? split(t)[0] : sdb; if (sdb !== tdb) S.dbMap[sdb] = tdb; }
+  for (const k of bad) { const t = S.srcHist[k].tgt, sdb = split(k)[0], tdb = t ? split(t)[0] : sdb; if (sdb !== tdb && !dbInRunningJob(sdb)) S.dbMap[sdb] = tdb; }
   const badT = bad.map(k => S.srcHist[k].tgt || k);
   if (!bad.length) return toast('실패한 테이블이 없습니다');
   const n = addToQueue(bad);
@@ -888,7 +916,7 @@ $('fileImport').onchange = async e => {
     const line = raw.trim(); if (!line || line.startsWith('#')) continue;
     const [db, t, tdb] = line.split(',').map(s => (s || '').trim().replace(/^"|"$/g, ''));
     if (!db || !t || (db === 'db' && t === 'table')) continue;
-    if (tdb && tdb !== db && /^[a-z0-9_]+$/i.test(tdb)) S.dbMap[db] = tdb.toLowerCase();
+    if (tdb && tdb !== db && /^[a-z0-9_]+$/i.test(tdb) && !dbInRunningJob(db)) S.dbMap[db] = tdb.toLowerCase();   // 실행 중인 DB는 그대로
     if (t === '*') {
       if (!S.dbs.some(d => d.db === db)) { miss.push(db + '.*'); continue; }
       for (const r of await ensureTables(db)) if (selectable(r)) keys.push(key(db, r.table));
@@ -1008,7 +1036,7 @@ function renderJob() {
        : `전체 ${pct}% · ` + (planning ? `1/2단계 준비: 원본 메타데이터 조회 ${j.meta_done}/${j.total}`
                 : `2/2단계 ${name}: 완료 ${j.done}/${j.total}` + (j.parallel ? ` (동시 처리: ${String(j.parallel).replace(/^동시\s*/, '')})` : ''))) + (j.stopping ? { graceful: ' (진행 중인 테이블 끝나면 중지)', now: ' (중지·되돌리는 중…)', force: ' (강제 종료 중…)' }[j.stopping] : '')
     : `대기 중 · 마지막 작업: ${name} ${j.finished} 종료` + (j.rc && !bad ? ` (rc=${j.rc})` : '');
-  for (const [s0, n] of Object.entries(cnt)) {
+  for (const [s0, n] of inStatusOrder(cnt)) {
     const s = j.kind === 'drop' ? (s0 === 'PENDING' ? 'DELQ' : s0 === 'RUNNING' ? 'DELETING' : s0) : s0;
     counts.append(h('span', { class: 'st ' + s.split(' ')[0] }, `${LABEL[s] || s} ${n}`));
   }
@@ -1051,7 +1079,7 @@ async function poll() {
     S.jobId = id;
     S.logLines.push(...j.lines); S.logOffset = j.next;
     if (S.logLines.length > 20000) S.logLines.splice(0, S.logLines.length - 20000);
-    S.job = j; syncParallel(j);
+    S.job = j; syncParallel(j); adoptJobItems(j);
     if (S.wasRunning && !j.running) await onJobDone(j);
     if (j.running && Date.now() - (S.tgtLoadedAt || 0) > 60000) {   // 작업 중에는 1분마다 대상 목록과 결과 기록 다시 읽기
       loadTargetDbs(true); loadHistory().then(renderTarget).catch(() => {});
@@ -1110,7 +1138,7 @@ async function onJobDone(j) {
   catch (e) { toast('불러오기 실패: ' + e.message, true); }
   renderSource(); renderTarget(); loadTargetDbs(false);
   const j = await api('/api/job?offset=0').catch(() => null);
-  if (j && j.kind) { S.logLines = j.lines; S.logOffset = j.next; S.job = j; S.wasRunning = j.running;
+  if (j && j.kind) { S.logLines = j.lines; S.logOffset = j.next; S.job = j; S.wasRunning = j.running; adoptJobItems(j);
                      renderJob(); renderLog(); if (j.running) openLog(true);
                      syncParallel(j); }
   poll();

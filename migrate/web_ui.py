@@ -200,6 +200,7 @@ class JobRunner:
         self.started = datetime.datetime.strptime(info['started'], '%Y-%m-%d %H:%M:%S')
         self.dry_run, self.parallel = info.get('dry_run', False), info.get('parallel')
         self.if_exists = info.get('if_exists')
+        self.db_map = info.get('db_map') or {}
         self.items = {k: 'PENDING' for k in info.get('items', [])}
         self.phase = info.get('phase')
         self.adopted = True
@@ -207,12 +208,13 @@ class JobRunner:
         self.lines = ['*** 웹 서버 재시작: 실행 중인 작업(pid %d)을 이어받았습니다 ***' % self.pid]
         threading.Thread(target=self._pump, daemon=True).start()
 
-    def _start(self, kind, args, items=None, dry_run=False, phase='plan', parallel=None, if_exists=None):
+    def _start(self, kind, args, items=None, dry_run=False, phase='plan', parallel=None, if_exists=None, db_map=None):
         with self.lock:
             if self.running():
                 raise ValueError('이미 실행 중인 작업이 있습니다 (%s)' % self.kind)
             # 실행 중인 작업이 없을 때만 바꿈 (확인 전에 바꾸면 거절된 요청이 실행 중인 작업의 값을 덮어씀)
             self.parallel, self.if_exists = parallel, if_exists
+            self.db_map = db_map or {}   # 원본 db -> 대상 db (이름을 바꾼 것만): 다른 브라우저의 화면도 대상 이름을 알게
             if parallel:   # 이전 실행이 남긴 제어 파일 값이 --parallel 을 덮지 않게, 프로세스보다 먼저 씀
                 self._write_control(int(parallel))
             env = dict(os.environ, PYTHONUNBUFFERED='1')
@@ -236,7 +238,7 @@ class JobRunner:
                 with open(self.pidfile, 'w', encoding='utf-8') as f:
                     json.dump({'pid': self.pid, 'kind': kind, 'out': self.out_path, 'items': list(self.items),
                                'dry_run': dry_run, 'phase': self.phase, 'parallel': getattr(self, 'parallel', None),
-                               'if_exists': getattr(self, 'if_exists', None),
+                               'if_exists': getattr(self, 'if_exists', None), 'db_map': self.db_map,
                                'started': self.started.strftime('%Y-%m-%d %H:%M:%S')}, f, ensure_ascii=False)
             except OSError:
                 pass
@@ -340,7 +342,8 @@ class JobRunner:
             args.append('--dry-run')
         self._start('dry-run' if opts['dry_run'] else 'migrate', args,
                     ['%s.%s' % it[:2] for it in items], opts['dry_run'],
-                    parallel='%d' % opts['parallel'], if_exists=opts['if_exists'])
+                    parallel='%d' % opts['parallel'], if_exists=opts['if_exists'],
+                    db_map={it[0]: it[2] for it in items if len(it) > 2 and it[2] and it[2] != it[0]})
 
     def _write_control(self, n):
         tmp = self.control + '.tmp'
@@ -416,7 +419,7 @@ class JobRunner:
                 'lines': self.lines[start:], 'next': self.dropped + len(self.lines),
                 'items': self.items, 'total': len(vals), 'done': done,
                 'phase': self.phase, 'meta_done': meta, 'parallel': getattr(self, 'parallel', None),
-                'if_exists': getattr(self, 'if_exists', None),
+                'if_exists': getattr(self, 'if_exists', None), 'db_map': getattr(self, 'db_map', {}),
             }
 
 
