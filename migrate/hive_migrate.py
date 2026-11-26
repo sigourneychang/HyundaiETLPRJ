@@ -45,6 +45,8 @@ DROP_PROPS = {
     'COLUMN_STATS_ACCURATE',
 }
 STATS_PROPS = ('numFiles', 'numRows', 'rawDataSize', 'totalSize')
+# EXPLAIN stage lines of a plan that runs a job (MapReduce in Hive 2 by default; Tez/Spark if configured)
+EXEC_STAGES = ('Map Reduce', 'Tez', 'Spark')
 
 # Config: only the cluster commands are required; everything else has a default
 # here and can be overridden in the INI only when needed.
@@ -100,6 +102,29 @@ class BadOutput(CommandError):
     """A result section came back but could not be parsed (e.g. a stray line instead of the count).
     Must never be read as a data difference: the read-only query is run again."""
     pass
+
+
+class Background(object):
+    """Run fn(*args) in a thread; result() re-raises its exception in the caller."""
+    def __init__(self, fn, *args):
+        self._exc = None
+
+        def run():
+            try:
+                fn(*args)
+            except BaseException as e:   # handed to the caller in result()
+                self._exc = e
+        self._thread = threading.Thread(target=run)
+        self._thread.daemon = True
+        self._thread.start()
+
+    def join(self):
+        self._thread.join()
+
+    def result(self):
+        self.join()
+        if self._exc is not None:
+            raise self._exc
 
 
 # Stop requests (set from signal handlers, see main()):
@@ -696,15 +721,15 @@ class Migrator:
         fq = '`%s`.`%s`' % (db, tbl)
         agg = 'count(1), sum(hash(*))' if self.validate == 'checksum' else 'count(1), 0'
         stmts = ['SET hive.compute.query.using.stats=false', marker('CNT'), 'SELECT %s FROM %s' % (agg, fq)]
-        if with_stats_count:  # what an end user's count(*) returns (may come from stats)
-            stmts += ['SET hive.compute.query.using.stats=true', marker('STATCNT'), 'SELECT count(*) FROM %s' % fq]
+        if with_stats_count:  # what an end user's count(*) returns: plan only (no job), see _stat_count
+            stmts += ['SET hive.compute.query.using.stats=true', marker('STATPLAN'), 'EXPLAIN SELECT count(*) FROM %s' % fq]
         if partitioned:
             stmts += [marker('PARTS'), 'SHOW PARTITIONS %s' % fq]
         return stmts
 
     @staticmethod
-    def _read_counts(got, partitioned=False):
-        require(got, *(('CNT', 'PARTS') if partitioned else ('CNT',)))
+    def _read_counts(got, partitioned=False, stats=False):
+        require(got, 'CNT', *(('PARTS',) if partitioned else ()) + (('STATPLAN',) if stats else ()))
         if not got['CNT']:
             raise CommandError('incomplete beeline output (empty count result) - connection lost?')
         cnt = got['CNT'][0].split('\t')
@@ -712,19 +737,41 @@ class Migrator:
             raise BadOutput('unreadable count result: %r' % got['CNT'][:3])
         rows = int(cnt[0])
         csum = cnt[1].strip() if len(cnt) > 1 else None
-        stat = None
-        if got.get('STATCNT'):
-            v = got['STATCNT'][0].strip()
-            stat = int(v) if v.lstrip('-').isdigit() else None
+        stat = Migrator._plan_uses_stats(got['STATPLAN']) if 'STATPLAN' in got else None
         parts = sorted(p.strip() for p in got['PARTS'] if p.strip()) if 'PARTS' in got else None
         return rows, csum, stat, parts
+
+    @staticmethod
+    def _plan_uses_stats(plan):
+        """EXPLAIN of count(*) with hive.compute.query.using.stats=true. Answered from metastore stats:
+        a Fetch stage only. Otherwise the plan has an execution stage that reads the data."""
+        if not any('STAGE PLANS' in l for l in plan):
+            raise BadOutput('unreadable count(*) plan: %r' % plan[:3])
+        return not any(l.strip() in EXEC_STAGES for l in plan)
+
+    def _stat_count(self, who, fq, uses_stats, rows):
+        """What an end user's count(*) returns. A plan that reads the data returns the real row count
+        (already counted, so no second scan); only a stats answer is fetched - a metastore lookup."""
+        if uses_stats is None:
+            return None
+        if not uses_stats:
+            return rows
+        for attempt in (1, 2):
+            got = require(split_marked(self.tgt.run(who, ['SET hive.compute.query.using.stats=true', marker('STATCNT'),
+                                                          'SELECT count(*) FROM %s' % fq], retry=True)), 'STATCNT')
+            v = (got['STATCNT'] or [''])[0].strip()
+            if v.lstrip('-').isdigit():
+                self.log.info(who, 'count(*) on target is answered from stats: %s' % v)
+                return int(v)
+            if attempt == 2:
+                raise BadOutput('unreadable count(*) result: %r' % got['STATCNT'][:3])
 
     def _query_counts(self, side, who, stmts, partitioned):
         """Run read-only validation statements and parse them; one more try on unreadable output."""
         for attempt in (1, 2):
             got = split_marked(side.run(who, stmts, retry=True))
             try:
-                return self._read_counts(got, partitioned)
+                return self._read_counts(got, partitioned, marker('STATPLAN') in stmts)
             except BadOutput as e:
                 if attempt == 2:
                     raise
@@ -866,10 +913,11 @@ class Migrator:
         if replace:
             stmts.append('DROP TABLE IF EXISTS %s PURGE' % fq_tgt)
         stmts += [new_ddl, marker('DESC'), 'DESCRIBE FORMATTED %s' % fq_tgt]
-        if job.kind != 'ACID':   # exact stats so count(*) is answered by the metastore
+        if job.kind != 'ACID':   # exact stats (0 rows); then check what count(*) returns
             stmts += ["ALTER TABLE %s SET TBLPROPERTIES ('numRows'='0', 'rawDataSize'='0', 'totalSize'='0', "
                       "'numFiles'='0', 'COLUMN_STATS_ACCURATE'='{\"BASIC_STATS\":\"true\"}')" % fq_tgt,
-                      'SET hive.compute.query.using.stats=true', marker('STATCNT'), 'SELECT count(*) FROM %s' % fq_tgt]
+                      'SET hive.compute.query.using.stats=true', marker('STATPLAN'),
+                      'EXPLAIN SELECT count(*) FROM %s' % fq_tgt]
         self.log.info(job.src, 'creating %s on target' % job.tgt)
         job.created = {'table': fq_tgt, 'path': tgt_loc, 'stage': None}
         got = require(split_marked(self.tgt.run(job.src, stmts)), 'DESC')
@@ -883,11 +931,11 @@ class Migrator:
         if n:
             raise CommandError('target table path %s already holds %d file(s)' % (path, n))
         job.tgt_rows, job.tgt_sum, job.tgt_parts = 0, None, None
-        if job.kind != 'ACID':
-            v = (got.get('STATCNT') or [''])[0].strip()
-            job.tgt_stats_rows = int(v) if v.lstrip('-').isdigit() else None
+        if job.kind != 'ACID':   # a scan of the (checked) empty directory returns 0
+            job.tgt_stats_rows = self._stat_count(job.src, fq_tgt, self._plan_uses_stats(
+                require(got, 'STATPLAN')['STATPLAN']), 0)
             if job.tgt_stats_rows != 0:
-                raise CommandError('count(*) on the new empty table returns %r' % v)
+                raise CommandError('count(*) on the new empty table returns %r' % job.tgt_stats_rows)
         job.created = None
         job.messages.append('empty table (fast path)')
         job.status = 'OK'
@@ -919,24 +967,66 @@ class Migrator:
         if job.fast:
             return self._migrate_empty(job, replace, tgt_loc, new_ddl, fq_tgt)
 
-        # 1) source side: validation numbers (+ staging copy for ACID)
+        # 1) source side: validation numbers (+ staging copy for ACID). Non-ACID: the source count runs
+        #    alongside the target steps (create, distcp, finalize) and is joined before the verdict.
         self.log.info(job.src, 'reading source (%s%s)' % (job.kind, ', partitioned' if job.partitioned else ''))
-        need_src_check = self.validate != 'none' or job.partitioned
-        if need_src_check:
-            job.src_rows, job.src_sum, _, job.src_parts = self._query_counts(self.src, job.src, self._validation_stmts(
-                job.src_db, job.table, job.partitioned, False), job.partitioned)
-            # 0 rows in a partitioned table: partitions may be missing from the source metastore
-            # (MSCK only matters for partitioned tables; it doesn't apply to ACID)
-            if job.src_rows == 0 and job.partitioned and job.kind != 'ACID' and self.repair_source:
-                # one partition column: table dir holds one dir per partition. If the dir count matches the
-                # partitions the metastore knows, nothing is unregistered -> skip MSCK (no source write)
-                ndirs = getattr(job, 'src_dirs', None)
-                if ndirs is not None and len(m['partition_cols']) == 1 and ndirs - 1 == len(job.src_parts or []):
-                    self.log.info(job.src, 'source has 0 rows; all %d partition dir(s) registered, MSCK skipped'
-                                  % len(job.src_parts or []))
-                else:
-                    self._repair_source_partitions(job)
+        src_work = None
+        if self.validate != 'none' or job.partitioned:
+            if job.kind == 'ACID':
+                self._read_source(job)
+            else:
+                src_work = Background(self._read_source, job)
+        try:
+            self._migrate_target(job, replace, src_path, tgt_loc, new_ddl, fq_tgt, stage)
+        finally:
+            if src_work:   # never leave a source query running behind a finished or failed table
+                src_work.join()
+        if src_work:
+            src_work.result()   # source failed: raises, the target table is rolled back
 
+        job.created = None   # target is complete; from here on nothing must be rolled back
+        if job.kind == 'ACID':
+            self._drop_source_stage(job)
+
+        # 5) verdict
+        problems = []
+        if self.validate != 'none':
+            if job.src_rows != job.tgt_rows:
+                problems.append('rows src=%s tgt=%s' % (job.src_rows, job.tgt_rows))
+            if self.validate == 'checksum' and job.src_sum != job.tgt_sum:
+                problems.append('checksum src=%s tgt=%s' % (job.src_sum, job.tgt_sum))
+            if job.tgt_stats_rows is not None and job.tgt_stats_rows != job.tgt_rows:
+                problems.append('count(*) on target returns %s (stats) but table has %s rows'
+                                % (job.tgt_stats_rows, job.tgt_rows))
+        if job.partitioned and job.src_parts != job.tgt_parts:
+            miss = sorted(set(job.src_parts or []) - set(job.tgt_parts or []))
+            problems.append('partitions src=%d tgt=%d missing=%s' % (
+                len(job.src_parts or []), len(job.tgt_parts or []), miss[:5]))
+        if problems:
+            job.fail('MISMATCH', '; '.join(problems))
+        else:
+            job.status = 'OK'
+
+    def _read_source(self, job):
+        """Source validation numbers; MSCK REPAIR on the source for a 0-row partitioned table."""
+        m = job.meta
+        job.src_rows, job.src_sum, _, job.src_parts = self._query_counts(self.src, job.src, self._validation_stmts(
+            job.src_db, job.table, job.partitioned, False), job.partitioned)
+        # 0 rows in a partitioned table: partitions may be missing from the source metastore
+        # (MSCK only matters for partitioned tables; it doesn't apply to ACID)
+        if job.src_rows == 0 and job.partitioned and job.kind != 'ACID' and self.repair_source:
+            # one partition column: table dir holds one dir per partition. If the dir count matches the
+            # partitions the metastore knows, nothing is unregistered -> skip MSCK (no source write)
+            ndirs = getattr(job, 'src_dirs', None)
+            if ndirs is not None and len(m['partition_cols']) == 1 and ndirs - 1 == len(job.src_parts or []):
+                self.log.info(job.src, 'source has 0 rows; all %d partition dir(s) registered, MSCK skipped'
+                              % len(job.src_parts or []))
+            else:
+                self._repair_source_partitions(job)
+
+    def _migrate_target(self, job, replace, src_path, tgt_loc, new_ddl, fq_tgt, stage):
+        """Steps 1b-4: ACID staging copy, target table, data, finalize + target validation numbers."""
+        m = job.meta
         copy_from = src_path
         if job.kind == 'ACID':
             pcols = m['partition_cols']
@@ -982,8 +1072,9 @@ class Migrator:
                 raise CommandError('target table path %s already holds %d file(s)' % (copy_to, n))
 
         # 3) data
-        if job.src_rows == 0 and not job.partitioned and not (replace and tgt_loc):
-            # partitioned: empty partition dirs still need copying; replaced external: old files must go
+        if job.kind == 'ACID' and job.src_rows == 0 and not job.partitioned:
+            # (non-ACID: the source count is still running, so always copy; a table with no files at all
+            # took the fast path. Partitioned: empty partition dirs still need copying)
             self.log.info(job.src, 'source has 0 rows, skipping distcp')
         else:
             self._distcp(job, copy_from, copy_to, replace and job.kind != 'ACID')
@@ -1006,34 +1097,12 @@ class Migrator:
             s.split(' ')[0] for s in post if not s.startswith(('SET', "SELECT '@@")))[:80])
         got = split_marked(self.tgt.run(job.src, post))
         try:
-            job.tgt_rows, job.tgt_sum, job.tgt_stats_rows, job.tgt_parts = self._read_counts(got, job.partitioned)
+            job.tgt_rows, job.tgt_sum, uses_stats, job.tgt_parts = self._read_counts(got, job.partitioned, True)
         except BadOutput as e:   # the writes above are done; re-run only the read-only validation part
             self.log.info(job.src, 'tgt %s - running the validation again' % e)
-            job.tgt_rows, job.tgt_sum, job.tgt_stats_rows, job.tgt_parts = self._query_counts(
+            job.tgt_rows, job.tgt_sum, uses_stats, job.tgt_parts = self._query_counts(
                 self.tgt, job.src, self._validation_stmts(job.tgt_db, job.table, job.partitioned, True), job.partitioned)
-
-        job.created = None   # target is complete; from here on nothing must be rolled back
-        if job.kind == 'ACID':
-            self._drop_source_stage(job)
-
-        # 5) verdict
-        problems = []
-        if self.validate != 'none':
-            if job.src_rows != job.tgt_rows:
-                problems.append('rows src=%s tgt=%s' % (job.src_rows, job.tgt_rows))
-            if self.validate == 'checksum' and job.src_sum != job.tgt_sum:
-                problems.append('checksum src=%s tgt=%s' % (job.src_sum, job.tgt_sum))
-            if job.tgt_stats_rows is not None and job.tgt_stats_rows != job.tgt_rows:
-                problems.append('count(*) on target returns %s (stats) but table has %s rows'
-                                % (job.tgt_stats_rows, job.tgt_rows))
-        if job.partitioned and job.src_parts != job.tgt_parts:
-            miss = sorted(set(job.src_parts or []) - set(job.tgt_parts or []))
-            problems.append('partitions src=%d tgt=%d missing=%s' % (
-                len(job.src_parts or []), len(job.tgt_parts or []), miss[:5]))
-        if problems:
-            job.fail('MISMATCH', '; '.join(problems))
-        else:
-            job.status = 'OK'
+        job.tgt_stats_rows = self._stat_count(job.src, fq_tgt, uses_stats, job.tgt_rows)
 
     # ---------------------------------------------------------------- views
     def migrate_view(self, job, existing):
@@ -1451,8 +1520,13 @@ def main():
             signal.signal(getattr(signal, sig), on_signal)
 
     # dropping only (empty) databases needs no table rows
-    rows = read_sources(a.sources, allow_empty=bool(a.drop_target and a.drop_databases),
-                        with_target=not a.drop_target)   # drop: db column already means the target db
+    rows = read_sources(a.sources, allow_empty=bool(a.drop_target and a.drop_databases), with_target=True)
+    if a.drop_target:   # drop: the db column is the TARGET db
+        renamed = sorted(set('%s->%s' % (d, t) for d, _, t in rows if t != d))
+        if renamed:   # a migration list fed to --drop-target would drop the tables under the source names
+            raise SystemExit('--drop-target: the db column is the target db; the tgt_db column is not allowed '
+                             '(found %s). List the target names in the db column.' % ', '.join(renamed[:5]))
+        rows = [(d, t) for d, t, _ in rows]
     try:
         migrator = Migrator(cfg, log, a.dry_run, run_id)
         migrator.control_path = a.control
