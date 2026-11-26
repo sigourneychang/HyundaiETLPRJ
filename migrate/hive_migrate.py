@@ -8,7 +8,7 @@ table from the SOURCE cluster to the TARGET cluster under the SAME db/table name
   2. create the table on the target          (DDL rewritten: db name, LOCATION, props)
   3. copy the data with distcp               (pulled from the source HDFS)
   4. register partitions (MSCK), fix stats   (copy source stats, or ANALYZE)
-  5. validate source vs target               (row count, optional checksum, partitions)
+  5. validate source vs target               (by size: checksum / row count / file level; partitions)
 
 ACID tables (transactional=true) are never file-copied: their delta dirs carry
 source-cluster transaction ids that the target metastore doesn't know. They go
@@ -61,7 +61,8 @@ DEFAULTS = {
     'staging': {'db': 'zz_migration_stage'},
     'result': {'db': 'migration_meta', 'table': 'migration_result'},
     'inventory': {'batch_size': '200', 'path_batch_size': '100'},
-    'run': {'parallel': '2', 'if_exists': 'resume', 'stats': 'copy', 'validate': 'checksum',
+    'run': {'parallel': '2', 'if_exists': 'resume', 'stats': 'copy', 'validate': 'auto',
+            'checksum_max_bytes': '100G', 'count_max_bytes': '1T',
             'repair_source': 'true', 'call_timeout': '900', 'retries': '2', 'max_dynamic_partitions': '100000'},
 }
 
@@ -92,6 +93,19 @@ def load_config(path, extra_required=None):
             if h and os.path.basename(h[-1]) == 'hadoop' else ''
     return cfg
 
+
+def parse_size(v):
+    """'100G', '1.5T', '1048576' -> bytes (K/M/G/T/P are powers of 1024)."""
+    m = re.match(r'^\s*(\d+(?:\.\d+)?)\s*([KMGTP]?)B?\s*$', str(v), re.I)
+    if not m:
+        raise ValueError('not a size: %r (e.g. 100G, 1T)' % v)
+    return int(float(m.group(1)) * 1024 ** ' KMGTP'.index((m.group(2) or ' ').upper()))
+
+
+VALIDATE_MODES = ('auto', 'checksum', 'count', 'files', 'none')
+# what each validation mode runs on each side (see _validation_stmts)
+SIDE_MODE = {'src': {'checksum': 'checksum', 'count': 'count', 'files': 'parts', 'none': 'parts'},
+             'tgt': {'checksum': 'checksum', 'count': 'count', 'files': 'count', 'none': 'parts'}}
 
 MAX_PARALLEL = 64     # upper bound for [run] parallel (also for a live change via --control)
 CONTROL_POLL = 3      # seconds: how often a running migration looks at the control file
@@ -436,6 +450,9 @@ class Job:
         self.src_files = None      # file count under the source table dir (plan-phase precheck), -1 = not checked
         self.tgt_pre = None        # plan-phase precheck of the target dir: {'path': p, 'files': n or None}
         self.fast = False          # empty source table: create + stats only (no count jobs, no distcp)
+        self.validated_by = None   # validation actually used: checksum | count | files | none
+        self.src_bytes = None      # source table dir size / file count (plan-phase path check)
+        self.tgt_files = self.tgt_bytes = None   # target dir after the copy (files validation)
         self.flags = set()         # result CSV `flags`: rolled_back, rollback_failed, resumable (see history.py)
 
     @property
@@ -483,7 +500,14 @@ class Migrator:
         self.distcp_timeout = cfg['distcp'].getint('timeout', 7200)
         self.if_exists = r.get('if_exists', 'replace')
         self.stats_mode = r.get('stats', 'copy')
-        self.validate = r.get('validate', 'checksum')
+        self.validate = r.get('validate', 'auto')
+        if self.validate not in VALIDATE_MODES:
+            raise CommandError('[run] validate must be one of %s' % ', '.join(VALIDATE_MODES))
+        try:   # validate=auto: checksum below the first size, row count below the second, file level above
+            self.checksum_max = parse_size(r.get('checksum_max_bytes', '100G'))
+            self.count_max = parse_size(r.get('count_max_bytes', '1T'))
+        except ValueError as e:
+            raise CommandError('[run] checksum_max_bytes / count_max_bytes: %s' % e)
         self.repair_source = r.getboolean('repair_source', True)
         self.parallel = r.getint('parallel', 2)
         self.meta_batch = r.getint('meta_batch', 50)      # tables per beeline session in the plan phase
@@ -673,8 +697,9 @@ class Migrator:
     def precheck_paths(self, tables, existing):
         """Plan phase, one batched hadoop call instead of per-table ones:
         - source table dir file counts -> empty tables take the fast path
-        - target dir file counts (external path / predicted managed path) -> no per-table check"""
-        if not tables or self.dry:
+        - target dir file counts (external path / predicted managed path) -> no per-table check
+        - source size -> validate=auto mode. Read-only, so a dry run does it too (shows the fast path and mode)."""
+        if not tables:
             return
         tdbs = sorted({j.tgt_db for j in tables})
         present = [d for d in tdbs if d in existing]
@@ -725,19 +750,44 @@ class Migrator:
                       % (len(uris), -(-len(uris) // self.path_batch) if uris else 0, n_fast))
 
     # ---------------------------------------------------------------- shared SQL bits    # ---------------------------------------------------------------- shared SQL bits
-    def _validation_stmts(self, db, tbl, partitioned, with_stats_count):
+    def validate_mode(self, job):
+        """Validation for this object. validate=auto picks by the source size from the plan-phase path check:
+        checksum (< checksum_max_bytes), count (< count_max_bytes), files (above). Unknown size -> count.
+        ACID -> at most count: its staging INSERT reads the whole source anyway, and the copied files are
+        the staging table's, not the table's."""
+        if self.validate != 'auto':
+            return self.validate
+        b = job.src_bytes
+        if job.kind == 'VIEW' or b is None:
+            return 'count'
+        if b < self.checksum_max:
+            return 'checksum'
+        if b < self.count_max or job.kind == 'ACID':
+            return 'count'
+        return 'files'
+
+    def _validation_stmts(self, db, tbl, partitioned, with_stats_count, mode='checksum'):
+        """Read-only validation statements for one side. mode (SIDE_MODE): checksum = count(1) + sum(hash(*)),
+        count = count(1), parts = partition list only (no data read). Can be empty (parts, unpartitioned)."""
         fq = '`%s`.`%s`' % (db, tbl)
-        agg = 'count(1), sum(hash(*))' if self.validate == 'checksum' else 'count(1), 0'
-        stmts = ['SET hive.compute.query.using.stats=false', marker('CNT'), 'SELECT %s FROM %s' % (agg, fq)]
-        if with_stats_count:  # what an end user's count(*) returns: plan only (no job), see _stat_count
-            stmts += ['SET hive.compute.query.using.stats=true', marker('STATPLAN'), 'EXPLAIN SELECT count(*) FROM %s' % fq]
+        stmts = []
+        if mode in ('checksum', 'count'):
+            agg = 'count(1), sum(hash(*))' if mode == 'checksum' else 'count(1), 0'
+            stmts = ['SET hive.compute.query.using.stats=false', marker('CNT'), 'SELECT %s FROM %s' % (agg, fq)]
+            if with_stats_count:  # what an end user's count(*) returns: plan only (no job), see _stat_count
+                stmts += ['SET hive.compute.query.using.stats=true', marker('STATPLAN'),
+                          'EXPLAIN SELECT count(*) FROM %s' % fq]
         if partitioned:
             stmts += [marker('PARTS'), 'SHOW PARTITIONS %s' % fq]
         return stmts
 
     @staticmethod
-    def _read_counts(got, partitioned=False, stats=False):
-        require(got, 'CNT', *(('PARTS',) if partitioned else ()) + (('STATPLAN',) if stats else ()))
+    def _read_counts(got, partitioned=False, stats=False, rows=True):
+        """-> (rows, checksum, count(*) answered from stats?, partitions). rows=False: no count was asked."""
+        require(got, *(('CNT',) if rows else ()) + (('PARTS',) if partitioned else ()) + (('STATPLAN',) if stats else ()))
+        parts = sorted(p.strip() for p in got['PARTS'] if p.strip()) if 'PARTS' in got else None
+        if not rows:
+            return None, None, None, parts
         if not got['CNT']:
             raise CommandError('incomplete beeline output (empty count result) - connection lost?')
         cnt = got['CNT'][0].split('\t')
@@ -746,7 +796,6 @@ class Migrator:
         rows = int(cnt[0])
         csum = cnt[1].strip() if len(cnt) > 1 else None
         stat = Migrator._plan_uses_stats(got['STATPLAN']) if 'STATPLAN' in got else None
-        parts = sorted(p.strip() for p in got['PARTS'] if p.strip()) if 'PARTS' in got else None
         return rows, csum, stat, parts
 
     @staticmethod
@@ -776,10 +825,12 @@ class Migrator:
 
     def _query_counts(self, side, who, stmts, partitioned):
         """Run read-only validation statements and parse them; one more try on unreadable output."""
+        if not stmts:
+            return None, None, None, None
         for attempt in (1, 2):
             got = split_marked(side.run(who, stmts, retry=True))
             try:
-                return self._read_counts(got, partitioned, marker('STATPLAN') in stmts)
+                return self._read_counts(got, partitioned, marker('STATPLAN') in stmts, marker('CNT') in stmts)
             except BadOutput as e:
                 if attempt == 2:
                     raise
@@ -828,7 +879,7 @@ class Migrator:
         self.log.info(job.src, 'source has 0 rows -> MSCK REPAIR on source (partitions in metastore: %d)' % n0)
         self.src.run(job.src, ['MSCK REPAIR TABLE %s' % fq], retry=True)
         job.src_rows, job.src_sum, _, job.src_parts = self._query_counts(self.src, job.src, self._validation_stmts(
-            job.src_db, job.table, True, False), True)
+            job.src_db, job.table, True, False, SIDE_MODE['src'][job.validated_by]), True)
         added = len(job.src_parts) - n0
         if added > 0:
             self.log.info(job.src, 'source MSCK REPAIR registered %d partition(s), source rows now %s'
@@ -1000,9 +1051,11 @@ class Migrator:
         fq_tgt = '`%s`.`%s`' % (job.tgt_db, job.table)
         stage = self._stage_name(job)
 
+        job.validated_by = 'files' if job.fast else self.validate_mode(job)   # empty: 0 files proves 0 rows
         if self.dry:
-            self.log.info(job.src, 'DRY-RUN kind=%s partitioned=%s -> %s%s\n%s' % (
-                job.kind, job.partitioned, job.tgt, ' (REPLACE)' if replace else '', new_ddl))
+            self.log.info(job.src, 'DRY-RUN kind=%s partitioned=%s size=%s validate=%s%s -> %s%s\n%s' % (
+                job.kind, job.partitioned, '?' if job.src_bytes is None else job.src_bytes, job.validated_by,
+                ' (empty, fast path)' if job.fast else '', job.tgt, ' (REPLACE)' if replace else '', new_ddl))
             job.status = 'DRY-RUN'
             return
 
@@ -1013,7 +1066,13 @@ class Migrator:
         #    alongside the target steps (create, distcp, finalize) and is joined before the verdict.
         self.log.info(job.src, 'reading source (%s%s)' % (job.kind, ', partitioned' if job.partitioned else ''))
         src_work = None
-        if self.validate != 'none' or job.partitioned:
+        if job.validated_by == 'files' and not job.partitioned:
+            # no source scan: the source row count comes from the source stats when they are exact
+            # (partitioned: table-level numRows isn't kept up to date -> not used)
+            p = m['params']
+            if '"BASIC_STATS":"true"' in p.get('COLUMN_STATS_ACCURATE', '') and p.get('numRows', '').isdigit():
+                job.src_rows = int(p['numRows'])
+        if job.partitioned or SIDE_MODE['src'][job.validated_by] != 'parts':   # anything to read on the source
             if job.kind == 'ACID':
                 self._read_source(job)
             else:
@@ -1032,11 +1091,20 @@ class Migrator:
 
         # 5) verdict
         problems = []
-        if self.validate != 'none':
+        mode = job.validated_by
+        if mode == 'files':   # no source scan: the copied files, plus the source row count from exact stats
+            if (job.src_files, job.src_bytes) != (job.tgt_files, job.tgt_bytes):
+                problems.append('files src=%s (%s bytes) tgt=%s (%s bytes)'
+                                % (job.src_files, job.src_bytes, job.tgt_files, job.tgt_bytes))
+            else:
+                job.messages.append('validated by files: %s file(s), %s bytes' % (job.tgt_files, job.tgt_bytes))
+        if mode in ('checksum', 'count') or (mode == 'files' and job.src_rows is not None):
             if job.src_rows != job.tgt_rows:
-                problems.append('rows src=%s tgt=%s' % (job.src_rows, job.tgt_rows))
-            if self.validate == 'checksum' and job.src_sum != job.tgt_sum:
-                problems.append('checksum src=%s tgt=%s' % (job.src_sum, job.tgt_sum))
+                problems.append('rows src=%s%s tgt=%s' % (job.src_rows, ' (stats)' if mode == 'files' else '',
+                                                          job.tgt_rows))
+        if mode == 'checksum' and job.src_sum != job.tgt_sum:
+            problems.append('checksum src=%s tgt=%s' % (job.src_sum, job.tgt_sum))
+        if mode != 'none':
             if job.tgt_stats_rows is not None and job.tgt_stats_rows != job.tgt_rows:
                 problems.append('count(*) on target returns %s (stats) but table has %s rows'
                                 % (job.tgt_stats_rows, job.tgt_rows))
@@ -1053,7 +1121,7 @@ class Migrator:
         """Source validation numbers; MSCK REPAIR on the source for a 0-row partitioned table."""
         m = job.meta
         job.src_rows, job.src_sum, _, job.src_parts = self._query_counts(self.src, job.src, self._validation_stmts(
-            job.src_db, job.table, job.partitioned, False), job.partitioned)
+            job.src_db, job.table, job.partitioned, False, SIDE_MODE['src'][job.validated_by]), job.partitioned)
         # 0 rows in a partitioned table: partitions may be missing from the source metastore
         # (MSCK only matters for partitioned tables; it doesn't apply to ACID)
         if job.src_rows == 0 and job.partitioned and job.kind != 'ACID' and self.repair_source:
@@ -1120,6 +1188,12 @@ class Migrator:
             self.log.info(job.src, 'source has 0 rows, skipping distcp')
         else:
             self._distcp(job, copy_from, copy_to, replace and job.kind != 'ACID')
+        if job.validated_by == 'files':   # (never ACID) what landed on the target, compared in the verdict
+            rc, out, err = self.tgt_fs.run(job.src, ['fs', '-count', self.tgt_uri + copy_to])
+            f = out.split()
+            if rc != 0 or len(f) < 4 or not (f[1].isdigit() and f[2].isdigit()):
+                raise CommandError('hadoop fs -count %s after the copy: %s' % (copy_to, _error_text(out, err)))
+            job.tgt_files, job.tgt_bytes = int(f[1]), int(f[2])
 
         # 4) partitions / ACID load / stats / validation on target
         post = []
@@ -1134,16 +1208,20 @@ class Migrator:
         elif job.partitioned:
             post.append('MSCK REPAIR TABLE %s' % fq_tgt)
         post += self._stats_stmts(job, fq_tgt)
-        post += self._validation_stmts(job.tgt_db, job.table, job.partitioned, True)
+        vstmts = self._validation_stmts(job.tgt_db, job.table, job.partitioned, True, SIDE_MODE['tgt'][job.validated_by])
+        post += vstmts
+        if not post:   # nothing to finalize or read (validate=none, unpartitioned, stats=none)
+            return
         self.log.info(job.src, 'finalizing on target (%s)' % ', '.join(
             s.split(' ')[0] for s in post if not s.startswith(('SET', "SELECT '@@")))[:80])
         got = split_marked(self.tgt.run(job.src, post))
+        rows = marker('CNT') in vstmts
         try:
-            job.tgt_rows, job.tgt_sum, uses_stats, job.tgt_parts = self._read_counts(got, job.partitioned, True)
+            job.tgt_rows, job.tgt_sum, uses_stats, job.tgt_parts = self._read_counts(got, job.partitioned, rows, rows)
         except BadOutput as e:   # the writes above are done; re-run only the read-only validation part
             self.log.info(job.src, 'tgt %s - running the validation again' % e)
             job.tgt_rows, job.tgt_sum, uses_stats, job.tgt_parts = self._query_counts(
-                self.tgt, job.src, self._validation_stmts(job.tgt_db, job.table, job.partitioned, True), job.partitioned)
+                self.tgt, job.src, vstmts, job.partitioned)
         job.tgt_stats_rows = self._stat_count(job.src, fq_tgt, uses_stats, job.tgt_rows)
 
     # ---------------------------------------------------------------- views
@@ -1164,6 +1242,7 @@ class Migrator:
             if exists:
                 stmts.append('DROP VIEW IF EXISTS `%s`.`%s`' % (job.tgt_db, job.table))
             stmts.append(ddl)
+            job.validated_by = 'none' if self.validate == 'none' else 'count'   # views: row count only
             if self.validate != 'none':
                 stmts += ['SET hive.compute.query.using.stats=false', marker('CNT'),
                           'SELECT count(1), 0 FROM `%s`.`%s`' % (job.tgt_db, job.table)]
@@ -1470,13 +1549,18 @@ def write_report(path, jobs):
         w = csv.writer(f)
         w.writerow(['src', 'tgt', 'kind', 'partitioned', 'status', 'src_rows', 'tgt_rows',
                     'tgt_count_star', 'src_checksum', 'tgt_checksum', 'src_partitions',
-                    'tgt_partitions', 'seconds', 'message', 'flags'])
+                    'tgt_partitions', 'seconds', 'message', 'flags',
+                    'validated_by', 'src_files', 'src_bytes', 'src_ddl_time'])
         for j in jobs:
             w.writerow([j.src, j.tgt, j.kind, j.partitioned, j.status, j.src_rows, j.tgt_rows,
                         j.tgt_stats_rows, j.src_sum, j.tgt_sum,
                         len(j.src_parts) if j.src_parts is not None else '',
                         len(j.tgt_parts) if j.tgt_parts is not None else '',
-                        '%.1f' % j.seconds, '; '.join(j.messages), ';'.join(sorted(j.flags))])
+                        '%.1f' % j.seconds, '; '.join(j.messages), ';'.join(sorted(j.flags)),
+                        # source state when migrated (to find tables changed since, before the cut-over)
+                        j.validated_by or '', '' if j.src_files in (None, -1) else j.src_files,
+                        '' if j.src_bytes is None else j.src_bytes,
+                        (j.meta or {}).get('params', {}).get('transient_lastDdlTime', '')])
     os.replace(tmp, path)
 
 
@@ -1521,8 +1605,9 @@ def main():
     ap.add_argument('--if-exists', choices=['resume', 'replace', 'skip', 'fail'],
                     help='override [run] if_exists (default resume: skip what the last run of the same '
                          'source -> target finished OK, drop and re-create anything else on the target)')
-    ap.add_argument('--validate', choices=['checksum', 'count', 'none'],
-                    help='override [run] validate (default checksum: row count + sum(hash(*)))')
+    ap.add_argument('--validate', choices=list(VALIDATE_MODES),
+                    help='override [run] validate (default auto: by source size checksum = row count + '
+                         'sum(hash(*)), count, or files = file count/bytes without a source scan)')
     ap.add_argument('--repair-source', choices=['true', 'false'], help='override [run] repair_source')
     ap.add_argument('--drop-target', action='store_true',
                     help='instead of migrating: DROP the listed tables on the TARGET cluster '

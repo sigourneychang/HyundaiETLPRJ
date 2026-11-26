@@ -548,7 +548,7 @@ def make_handler(app):
                     opts = {
                         'dry_run': bool(body.get('dry_run')),
                         'if_exists': _choice(body.get('if_exists'), ('resume', 'replace', 'skip', 'fail')),
-                        'validate': _choice(body.get('validate'), ('checksum', 'count', 'none')),
+                        'validate': _choice(body.get('validate'), ('auto', 'checksum', 'count', 'files', 'none')),
                         'parallel': max(1, min(int(body.get('parallel') or 2), 64)),
                         'repair_source': 'true' if body.get('repair_source', True) else 'false',
                     }

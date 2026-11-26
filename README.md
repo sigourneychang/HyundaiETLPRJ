@@ -42,7 +42,7 @@ python3 migrate/web_ui.py -c conf/prod.ini
 | `--parallel N` | 2 | 동시에 처리할 테이블 수 |
 | `--control FILE` | 없음 | JSON `{"parallel": N}` 파일. 실행 중에 고치면 몇 초 안에 반영 |
 | `--if-exists` | `resume` | 대상에 이미 있을 때: 같은 원본에서 OK로 옮긴 것은 건너뛰고 나머지는 다시 만듦 / 모두 다시 만듦(`replace`) / 건너뜀(`skip`) / 실패(`fail`) |
-| `--validate` | `checksum` | `count(1)` + `sum(hash(*))` 비교. `count`는 행 수만, `none`은 검증 안 함 |
+| `--validate` | `auto` | 원본 크기별로 고름: 100G 미만 `checksum`(`count(1)` + `sum(hash(*))`), 1T 미만 `count`(행 수), 그 이상 `files`(원본을 읽지 않고 파일 수·바이트 비교). `none`은 검증 안 함 |
 | `--repair-source` | `true` | 원본 행 수가 0인 파티션 테이블은 원본에서 MSCK REPAIR 실행 |
 | `--drop-target` | | 이관 대신 목록의 대상 테이블을 삭제 (`--drop-databases`로 빈 DB도 삭제) |
 

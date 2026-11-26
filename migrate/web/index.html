@@ -223,7 +223,7 @@ button.primary.danger { background: var(--bad); border-color: var(--bad); color:
       <select id="optIfExists" title="기본(이어 하기): 이 도구로 같은 대상에 옮겨 OK로 끝난 테이블은 건너뛰고, 그 밖에 대상에 있는 것(실패, 불일치, 도구 기록 없음)은 지우고 다시 만듭니다"><option value="resume">이어 하기 (OK는 건너뜀)</option>
         <option value="replace">모두 지우고 다시 만듦</option><option value="skip">건너뜀</option><option value="fail">실패 처리</option></select></label>
     <label>검증
-      <select id="optValidate" title="행 수 + 해시: 원본과 대상 모두 전체 데이터를 읽어 내용까지 비교 (기본)"><option value="checksum">행 수 + 해시</option><option value="count">행 수</option><option value="none">안 함</option></select></label>
+      <select id="optValidate" title="크기별 (기본): 작은 테이블은 행 수 + 해시, 중간은 행 수, 큰 테이블은 파일 수·크기 비교(원본을 읽지 않음). 경계는 설정의 checksum_max_bytes / count_max_bytes"><option value="auto">크기별</option><option value="checksum">행 수 + 해시</option><option value="count">행 수</option><option value="files">파일 수·크기</option><option value="none">안 함</option></select></label>
     <label title="테이블·뷰를 동시에 몇 개 처리할지. 이관 실행 중에 바꾸면 몇 초 안에 반영됩니다 (줄이면 진행 중인 테이블은 끝까지 둠)">동시 처리 <input type="number" id="optParallel" min="1" max="64" value="2"></label>
     <label title="파티션 테이블의 원본 행 수가 0이면, HDFS에만 있고 원본 메타스토어에 없는 파티션을 원본에서 MSCK REPAIR로 등록한 뒤 다시 셉니다"><input type="checkbox" id="optRepair" checked> 원본 0행이면 MSCK 복구</label>
     <span class="grow"></span>
