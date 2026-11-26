@@ -48,8 +48,9 @@ class Inventory:
         self.path, self.mtime, self.dbs = None, None, {}
 
     def latest_file(self):
+        # the inventory itself only: inventory_<yyyymmdd_hhmmss>.csv (not *_sources*.csv, the wave files etc.)
         files = [f for f in glob.glob(os.path.join(self.report_dir, 'inventory_*.csv'))
-                 if not f.endswith('_sources.csv')]
+                 if re.match(r'^inventory_\d{8}_\d{6}\.csv$', os.path.basename(f))]
         return max(files, key=os.path.getmtime) if files else None
 
     def load(self):

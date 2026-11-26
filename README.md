@@ -13,7 +13,7 @@ DB 전체나 테이블 단위로 옮기고, 옮긴 뒤 원본과 대상의 행 �
 |---|---|
 | `migrate/hive_migrate.py` | 이관 CLI. 메타 조회, DDL 재작성, distcp 복사, 검증, 실패 시 되돌리기, 대상 삭제 |
 | `migrate/history.py` | 결과 CSV 이력. 이어 하기(resume) 판단과 웹 화면 상태에 함께 씀 |
-| `migrate/hive_inventory.py` | 원본 인벤토리(읽기 전용). 테이블 종류, 형식, 파티션, 크기를 CSV로 남김 |
+| `migrate/hive_inventory.py` | 원본 인벤토리(읽기 전용). 테이블 종류, 형식, 파티션, 크기, 마지막 변경 시각을 CSV로 남기고 이관 목록(웨이브별)을 만듦. 전환 직전 변경 감지(`--drift`) |
 | `migrate/web_ui.py`, `migrate/web/index.html` | 웹 화면 (원본 \| 이관 목록 \| 이관 결과) |
 | `conf/local.ini` | 설정 예시 (로컬 Docker 테스트 환경용) |
 | `docs/작업노트.md` | 운영 개발 명세 |
@@ -24,14 +24,17 @@ DB 전체나 테이블 단위로 옮기고, 옮긴 뒤 원본과 대상의 행 �
 ## 사용법
 
 ```bash
-# 1) 원본 인벤토리 (읽기 전용)
-python3 migrate/hive_inventory.py -c conf/prod.ini --all
+# 1) 원본 인벤토리 (읽기 전용). --split-by-size: 이관 목록을 크기별 웨이브 파일로 나눔
+python3 migrate/hive_inventory.py -c conf/prod.ini --all --split-by-size
 
-# 2) 이관 - sources.csv: "db,table[,tgt_db]" (table 이 * 이면 DB 전체)
+# 2) 이관 - sources.csv: "db,table[,tgt_db]" (table 이 * 이면 DB 전체). 웨이브 파일을 순서대로 하나씩
 python3 migrate/hive_migrate.py -c conf/prod.ini -s sources.csv --dry-run      # 계획만 확인
 python3 migrate/hive_migrate.py -c conf/prod.ini -s sources.csv --parallel 4
 
-# 3) 웹 화면 (기본 127.0.0.1:8080, 원격 서버라면 SSH 터널로 접속)
+# 3) 전환 직전: 이관 뒤 원본이 바뀐 테이블 찾기 -> 나온 목록을 --if-exists replace 로 다시 이관
+python3 migrate/hive_inventory.py -c conf/prod.ini --drift reports
+
+# 4) 웹 화면 (기본 127.0.0.1:8080, 원격 서버라면 SSH 터널로 접속)
 python3 migrate/web_ui.py -c conf/prod.ini
 ```
 

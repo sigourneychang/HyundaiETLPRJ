@@ -46,7 +46,10 @@ class History:
         src, tgt, st, msg = r['src'], (r.get('tgt') or r['src']), r['status'], r.get('message', '')
         flags = row_flags(r)
         row = {'src': src, 'tgt': tgt, 'status': st, 'kind': r['kind'], 'src_rows': r['src_rows'],
-               'tgt_rows': r['tgt_rows'], 'message': msg, 'run_id': run_id, 'flags': sorted(flags)}
+               'tgt_rows': r['tgt_rows'], 'message': msg, 'run_id': run_id, 'flags': sorted(flags),
+               # source state when migrated ('' in CSVs written before these columns existed): drift check
+               'src_files': r.get('src_files') or '', 'src_bytes': r.get('src_bytes') or '',
+               'src_ddl_time': r.get('src_ddl_time') or ''}
         not_started = st == 'STOPPED' and msg.startswith('not started')
         if st == 'DROPPED':   # dropping is not a migration attempt: the source goes back to 'not migrated'
             s0 = tgt2src.pop(tgt, None)

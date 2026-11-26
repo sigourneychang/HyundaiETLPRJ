@@ -31,8 +31,9 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hive_migrate import (Beeline, CommandError, Hadoop, Log, is_default_managed_path,  # noqa: E402
-                          load_config, marker, parse_describe, read_sources, split_marked, strip_uri)
+from hive_migrate import (DEFAULTS, Beeline, CommandError, Hadoop, Log, is_default_managed_path,  # noqa: E402
+                          load_config, marker, parse_describe, parse_size, read_sources, split_marked, strip_uri)
+from history import History  # noqa: E402
 
 SKIP_DBS = {'sys', 'information_schema'}
 FORMATS = {
@@ -197,6 +198,60 @@ class Inventory:
             for r in ex.map(one, batches):
                 res.update(r)
         return res
+
+    # ------------------------------------------------------------ drift (before the cut-over)
+    def drift(self, report_dir):
+        """Tables that are OK on the target (result history) whose source changed since they were migrated:
+        file count / bytes of the table directory and transient_lastDdlTime, compared with what the result
+        CSV recorded at migration time. Source reads only: DESCRIBE and `hadoop fs -count`.
+        Returns rows {src, tgt, kind, result, detail, run_id}; result = changed | gone | unknown | same."""
+        h = History(report_dir)
+        h.load()
+        ok = sorted((r for r in h.target.values() if r['status'] == 'OK'), key=lambda r: (r['src'], r['tgt']))
+        keys = sorted({tuple(r['src'].split('.', 1)) for r in ok})
+        self.log.info('drift', '%d OK table(s) on the target from %s, %d source table(s) to check'
+                      % (len(ok), report_dir, len(keys)))
+        desc = self.describe(keys) if keys else {}
+        now = {}
+        for k in keys:
+            d = desc.get(k)
+            if isinstance(d, CommandError) or d is None:
+                now[k] = {'error': str(d or 'no output')}
+                continue
+            m = parse_describe(d)
+            now[k] = {'view': m['table_type'] == 'VIRTUAL_VIEW', 'location': strip_uri(m['location'] or ''),
+                      'ddl_time': m['params'].get('transient_lastDdlTime', '')}
+        sz = self.sizes([v['location'] for v in now.values() if v.get('location') and not v['view']])
+        out = []
+        for r in ok:
+            k = tuple(r['src'].split('.', 1))
+            cur = now[k]
+            row = {'src': r['src'], 'tgt': r['tgt'], 'kind': r['kind'], 'run_id': r['run_id']}
+            if 'error' in cur:
+                gone = re.search(r'Table not found|does not exist', cur['error'], re.I)
+                row.update(result='gone' if gone else 'unknown', detail=cur['error'][:200])
+                out.append(row)
+                continue
+            diffs, known = [], False
+            if r['src_ddl_time']:
+                known = True
+                if r['src_ddl_time'] != cur['ddl_time']:
+                    diffs.append('ddl_time %s -> %s' % (r['src_ddl_time'], cur['ddl_time']))
+            if not cur['view'] and r['src_files'] != '' and r['src_bytes'] != '':
+                known = True
+                s0 = sz.get(cur['location'].rstrip('/')) or sz.get(cur['location'])
+                if s0 is None:
+                    diffs.append('directory %s not found' % cur['location'])
+                elif (str(s0[1]), str(s0[2])) != (r['src_files'], r['src_bytes']):
+                    diffs.append('files %s -> %d, bytes %s -> %d' % (r['src_files'], s0[1], r['src_bytes'], s0[2]))
+            if diffs:
+                row.update(result='changed', detail='; '.join(diffs))
+            elif known:
+                row.update(result='same', detail='')
+            else:
+                row.update(result='unknown', detail='no source state recorded (result CSV older than the columns)')
+            out.append(row)
+        return out
 
     # ------------------------------------------------------------ assemble
     def run(self, rows):
@@ -390,6 +445,61 @@ def write_sources(records, path, origin):
     return len(ok), len(bad)
 
 
+WAVES = ('wave1_small', 'wave2_medium', 'wave3_large', 'wave4_views')
+
+
+def wave_of(r, small_max, medium_max):
+    """Wave of one inventory record (same size limits as validate=auto). Views go last: a view can only be
+    created once the tables it reads are on the target. Unknown size counts as medium."""
+    if r['kind'] == 'VIEW':
+        return WAVES[3]
+    b = r['size_bytes'] if isinstance(r['size_bytes'], int) else None
+    if b is not None and b < small_max:
+        return WAVES[0]
+    if b is None or b < medium_max:
+        return WAVES[1]
+    return WAVES[2]
+
+
+def write_waves(records, base, origin, small_max, medium_max, max_per_file):
+    """Sources CSVs by size wave, at most max_per_file objects each: <base>_<wave>_NNN.csv, in the order
+    to run them. Objects that can't be migrated go to <base>_not_migratable.csv (commented out).
+    Returns [(path, objects)]."""
+    ok = [r for r in records if r['kind'] in KIND_ORDER]
+    out = []
+    for wave in WAVES:
+        sel = sorted((r for r in ok if wave_of(r, small_max, medium_max) == wave), key=lambda r: (r['db'], r['table']))
+        for n, i in enumerate(range(0, len(sel), max_per_file), 1):
+            path = '%s_%s_%03d.csv' % (base, wave, n)
+            write_sources(sel[i:i + max_per_file], path, '%s (%s %d)' % (origin, wave, n))
+            out.append((path, len(sel[i:i + max_per_file])))
+    bad = [r for r in records if r['kind'] not in KIND_ORDER]
+    if bad:
+        path = '%s_not_migratable.csv' % base
+        write_sources(bad, path, origin)
+        out.append((path, 0))
+    return out
+
+
+def write_drift(rows, base):
+    """<base>.csv: every checked table; <base>_sources.csv: the changed ones, to migrate again with
+    --if-exists replace (db,table,tgt_db)."""
+    with open(base + '.csv', 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=['src', 'tgt', 'kind', 'result', 'detail', 'run_id'])
+        w.writeheader()
+        w.writerows(rows)
+    changed = [r for r in rows if r['result'] == 'changed']
+    with open(base + '_sources.csv', 'w', newline='', encoding='utf-8') as f:
+        f.write('# source tables changed since they were migrated (%s.csv)\n'
+                '# migrate again with: --if-exists replace\n' % os.path.basename(base))
+        w = csv.writer(f)
+        w.writerow(['db', 'table', 'tgt_db'])
+        for r in changed:
+            db, t = r['src'].split('.', 1)
+            w.writerow([db, t, r['tgt'].split('.', 1)[0]])
+    return changed
+
+
 def load_inventory_csv(path):
     records = []
     with open(path, newline='', encoding='utf-8') as f:
@@ -408,19 +518,43 @@ def main():
     scope.add_argument('-s', '--sources', help='CSV: db,table (table * = whole db)')
     scope.add_argument('--from-inventory', metavar='CSV',
                        help='only (re)generate a sources CSV from an existing inventory CSV')
+    scope.add_argument('--drift', metavar='REPORT_DIR',
+                       help='before the cut-over: list tables OK on the target (result CSVs in REPORT_DIR) '
+                            'whose source changed since they were migrated')
     ap.add_argument('-o', '--sources-out', help='where to write the generated sources CSV '
                     '(default: next to the inventory report)')
     ap.add_argument('--batch-size', type=int, help='override [inventory] batch_size')
     ap.add_argument('--parallel', type=int, help='override [run] parallel')
     ap.add_argument('--recent-days', type=int, default=RECENT_DAYS,
                     help='summary: list tables changed within this many days (default %d)' % RECENT_DAYS)
+    ap.add_argument('--split-by-size', action='store_true',
+                    help='write the sources as size waves (small, medium, large, views; limits = [run] '
+                         'checksum_max_bytes / count_max_bytes) instead of one file')
+    ap.add_argument('--max-per-file', type=int, default=3000, help='with --split-by-size: objects per file')
     ap.add_argument('--report-dir', default='reports')
     a = ap.parse_args()
 
+    run_cfg = load_config(a.config, extra_required={'src': ('hadoop',)})['run'] if a.config else DEFAULTS['run']
+    try:
+        small_max = parse_size(run_cfg.get('checksum_max_bytes') or DEFAULTS['run']['checksum_max_bytes'])
+        medium_max = parse_size(run_cfg.get('count_max_bytes') or DEFAULTS['run']['count_max_bytes'])
+    except ValueError as e:
+        ap.error('[run] checksum_max_bytes / count_max_bytes: %s' % e)
+    if a.max_per_file < 1:
+        ap.error('--max-per-file must be at least 1')
+
+    def sources(records, default_base, origin):
+        if a.split_by_size:
+            files = write_waves(records, os.path.splitext(a.sources_out)[0] if a.sources_out else default_base,
+                                origin, small_max, medium_max, a.max_per_file)
+            return '\n'.join('           %s  (%d)' % f for f in files).lstrip()
+        out = a.sources_out or default_base + '.csv'
+        n_ok, n_bad = write_sources(records, out, origin)
+        return '%s  (%d to migrate, %d commented out)' % (out, n_ok, n_bad)
+
     if a.from_inventory:
-        out = a.sources_out or os.path.splitext(a.from_inventory)[0] + '_sources.csv'
-        n_ok, n_bad = write_sources(load_inventory_csv(a.from_inventory), out, a.from_inventory)
-        print('sources: %s  (%d to migrate, %d commented out)' % (out, n_ok, n_bad))
+        print('sources:   ' + sources(load_inventory_csv(a.from_inventory),
+                                      os.path.splitext(a.from_inventory)[0] + '_sources', a.from_inventory))
         return
     if not a.config:
         ap.error('-c/--config is required unless --from-inventory is used')
@@ -433,6 +567,26 @@ def main():
 
     os.makedirs(a.report_dir, exist_ok=True)
     stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    if a.drift:
+        base = os.path.join(a.report_dir, 'drift_%s' % stamp)
+        log = Log(base + '.log')
+        try:
+            rows = Inventory(cfg, log).drift(a.drift)
+        except CommandError as e:
+            log.info('main', 'ABORTED: %s' % e)
+            sys.exit(2)
+        changed = write_drift(rows, base)
+        n = {}
+        for r in rows:
+            n[r['result']] = n.get(r['result'], 0) + 1
+        for r in rows:
+            if r['result'] != 'same':
+                print('  %-8s %-45s %s' % (r['result'], r['src'] + (' -> ' + r['tgt'] if r['tgt'] != r['src'] else ''),
+                                          r['detail'][:120]))
+        print('\nchecked %d: %s' % (len(rows), '  '.join('%s=%d' % kv for kv in sorted(n.items()))))
+        print('drift:   %s.csv\nsources: %s_sources.csv  (%d changed: migrate again with --if-exists replace)'
+              '\nlog:     %s.log' % (base, base, len(changed), base))
+        sys.exit(1 if changed or n.get('gone') else 0)
     base = os.path.join(a.report_dir, 'inventory_%s' % stamp)
     log = Log(base + '.log')
     started = datetime.datetime.now()
@@ -448,12 +602,11 @@ def main():
     summary = summarize(records, a.recent_days)
     with open(base + '_summary.txt', 'w', encoding='utf-8') as f:
         f.write(summary + '\n')
-    sources_out = a.sources_out or base + '_sources.csv'
-    n_ok, n_bad = write_sources(records, sources_out, os.path.basename(base) + '.csv')
+    src_text = sources(records, base + '_sources', os.path.basename(base) + '.csv')
     print('\n' + summary)
     print('\nelapsed: %s' % str(datetime.datetime.now() - started).split('.')[0])
-    print('inventory: %s.csv\nsummary:   %s_summary.txt\nsources:   %s  (%d to migrate, %d commented out)'
-          '\nlog:       %s.log' % (base, base, sources_out, n_ok, n_bad, base))
+    print('inventory: %s.csv\nsummary:   %s_summary.txt\nsources:   %s\nlog:       %s.log'
+          % (base, base, src_text, base))
 
 
 if __name__ == '__main__':
