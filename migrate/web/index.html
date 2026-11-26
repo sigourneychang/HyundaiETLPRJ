@@ -162,7 +162,7 @@ button.primary.danger { background: var(--bad); border-color: var(--bad); color:
     <div class="panel-head">
       <div class="title"><b>원본 (SOURCE)</b></div>
       <div class="row">
-        <span class="fold"><button class="small" id="btnExpandSrc" title="모든 DB 펼치기">⊞</button><button class="small" id="btnCollapseSrc" title="모든 DB 접기">⊟</button></span><input type="search" id="srcSearch" placeholder="db.table 검색">
+        <span class="fold"><button class="small" id="btnPickAllSrc" title="지금 보이는 조건(검색·필터)의 테이블 전체 선택. 모두 선택돼 있으면 해제">☑</button><button class="small" id="btnExpandSrc" title="모든 DB 펼치기">⊞</button><button class="small" id="btnCollapseSrc" title="모든 DB 접기">⊟</button></span><input type="search" id="srcSearch" placeholder="db.table 검색">
         <select id="srcKind" title="종류">
           <option value="">전체 종류</option><option>EXTERNAL</option><option>MANAGED</option>
           <option>ACID</option><option>VIEW</option>
@@ -190,7 +190,7 @@ button.primary.danger { background: var(--bad); border-color: var(--bad); color:
           <button class="small" id="btnExport" title="이관 목록을 sources.csv 형식으로 저장">저장</button>
           <button class="small" id="btnClear" title="이관 목록을 모두 비움 (대상 클러스터는 바뀌지 않음)">비우기</button>
         </span></div>
-      <div class="row"><span class="fold"><button class="small" id="btnExpandList" title="모든 DB 펼치기">⊞</button><button class="small" id="btnCollapseList" title="모든 DB 접기">⊟</button></span><input type="search" id="listSearch" placeholder="db.table 검색"></div>
+      <div class="row"><span class="fold"><button class="small" id="btnPickAllList" title="지금 보이는 조건(검색·필터)의 테이블 전체 선택. 모두 선택돼 있으면 해제">☑</button><button class="small" id="btnExpandList" title="모든 DB 펼치기">⊞</button><button class="small" id="btnCollapseList" title="모든 DB 접기">⊟</button></span><input type="search" id="listSearch" placeholder="db.table 검색"></div>
     </div>
     <div class="tree" id="listTree"></div>
     <div class="panel-foot"><span class="sum" id="cntList"></span>[목록 이관 실행]으로 옮길 테이블. 성공하면 오른쪽 [이관 결과]로 이동합니다.</div>
@@ -205,7 +205,7 @@ button.primary.danger { background: var(--bad); border-color: var(--bad); color:
           <button class="small danger" id="btnDropTarget" title="체크한 테이블을 대상 클러스터에서 삭제(DROP)합니다. external 테이블은 복사된 파일도 지웁니다. 원본은 건드리지 않습니다">선택 삭제</button>
         </span></div>
       <div class="row">
-        <span class="fold"><button class="small" id="btnExpandResult" title="모든 DB 펼치기">⊞</button><button class="small" id="btnCollapseResult" title="모든 DB 접기">⊟</button></span><input type="search" id="resultSearch" placeholder="db.table 검색">
+        <span class="fold"><button class="small" id="btnPickAllResult" title="지금 보이는 조건(검색·필터)의 테이블 전체 선택(빈 DB는 제외). 모두 선택돼 있으면 해제">☑</button><button class="small" id="btnExpandResult" title="모든 DB 펼치기">⊞</button><button class="small" id="btnCollapseResult" title="모든 DB 접기">⊟</button></span><input type="search" id="resultSearch" placeholder="db.table 검색">
         <select id="resultState">
           <option value="">전체</option><option value="ok">성공</option>
           <option value="bad">불일치 (검증 실패)</option>
@@ -280,7 +280,7 @@ const $ = id => document.getElementById(id);
 const S = {
   dbs: [], tables: {}, info: {},         // 인벤토리
   open: new Set(), picked: new Set(),     // 왼쪽 펼침 / 체크
-  queue: [], tgtPicked: new Set(), resPicked: new Set(), resDbPicked: new Set(), tgtOpen: new Set(), paneDbs: {},
+  queue: [], tgtPicked: new Set(), resPicked: new Set(), resDbPicked: new Set(), tgtExpanded: new Set(), paneDbs: {},   // 이관 목록·결과 칸에서 펼친 DB ('list:db'), 처음엔 모두 접힘
   tgtDbs: null, tgtDbsErr: null,
   dbMap: {},        // 이관 목록의 대상 DB 이름 바꾸기 {원본 db: 대상 db} (DB 단위, 테이블 이름은 그대로)
   srcHist: {},      // 원본 이름 기준 마지막 결과 (S.history는 대상 이름 기준)   // 대상 클러스터의 실제 DB 목록 (테이블이 없는 DB도 표시)
@@ -575,15 +575,16 @@ function groupByDb(keys) {
   for (const db in by) by[db].sort();
   return by;
 }
-function tgtDbNode(pane, db, ks, statusOf, picked) {   // picked: 체크박스용 Set (없으면 체크박스 없음)
+function tgtDbNode(pane, db, ks, statusOf, picked, forceOpen) {   // picked: 체크박스용 Set (없으면 체크박스 없음)
   (S.paneDbs[pane] = S.paneDbs[pane] || []).push(db);
   const cnt = {};
   for (const k of ks) { const s = statusOf(k); cnt[s] = (cnt[s] || 0) + 1; }
   const nP = picked ? ks.filter(k => picked.has(k)).length : 0;
-  const open = !S.tgtOpen.has(pane + ':' + db);   // 기본은 펼침, 접은 것만 기억
+  // 기본은 접힘, 펼친 것만 기억. 검색 중에는 맞는 테이블이 보이게 펼침 (forceOpen)
+  const open = forceOpen || S.tgtExpanded.has(pane + ':' + db);
   return [open, h('div', { class: 'node db' },
-    h('span', { class: 'caret', onclick: () => { const id = pane + ':' + db;
-      S.tgtOpen.has(id) ? S.tgtOpen.delete(id) : S.tgtOpen.add(id); renderTarget(); } }, open ? '▼' : '▶'),
+    h('span', { class: 'caret', title: forceOpen ? '검색 중에는 펼쳐서 보여줍니다' : '펼치기/접기', onclick: () => { if (forceOpen) return; const id = pane + ':' + db;
+      S.tgtExpanded.has(id) ? S.tgtExpanded.delete(id) : S.tgtExpanded.add(id); renderTarget(); } }, open ? '▼' : '▶'),
     picked ? h('input', { type: 'checkbox', checked: nP > 0 && nP === ks.length, indeterminate: nP > 0 && nP < ks.length,
       title: pane === 'result' ? 'DB의 결과 전체 선택' : null,
       onchange: e => { for (const k of ks) e.target.checked ? picked.add(k) : picked.delete(k); renderTarget(); } }) : null,
@@ -623,7 +624,7 @@ function renderList() {
   $('cntList').textContent = S.queue.length ? dbTblText(S.queue) + (S.tgtPicked.size ? ` · 선택: ${dbTblText(S.tgtPicked)}` : '') : '';
   const by = groupByDb(S.queue.filter(k => !q || k.toLowerCase().includes(q)));
   for (const db of Object.keys(by).sort()) {
-    const [open, node] = tgtDbNode('list', db, by[db], listStatus, S.tgtPicked); frag.append(node);
+    const [open, node] = tgtDbNode('list', db, by[db], listStatus, S.tgtPicked, !!q); frag.append(node);
     const nameEl = node.querySelector('.name'), tdb = tgtDbOf(db);
     nameEl.replaceChildren(db, tdb !== db ? h('span', { class: 'rename', title: '대상 클러스터에서 쓸 DB 이름' }, ' → ' + tdb) : '');
     nameEl.after(h('button', { class: 'small icon', title: '대상 DB 이름 바꾸기 (이 DB의 모든 테이블에 적용, 테이블 이름은 그대로)',
@@ -645,6 +646,12 @@ function renderList() {
   else if (!Object.keys(by).length) frag.append(h('div', { class: 'empty' }, '검색 결과 없음'));
   const tree = $('listTree'), top = tree.scrollTop; tree.replaceChildren(frag); tree.scrollTop = top;
 }
+// 이관 결과 칸에 지금 보이는 테이블 (검색어·상태 필터 적용)
+function resultShown(all) {
+  const q = $('resultSearch').value.trim().toLowerCase(), f = $('resultState').value;
+  return [...(all || resultKeySet())].filter(k => (!q || k.toLowerCase().includes(q)) &&
+    (!f || (f === 'ok' ? resultStatus(k) === 'OK' : BAD.has(resultStatus(k)))));
+}
 function renderResult() {
   S.paneDbs.result = [];
   const q = $('resultSearch').value.trim().toLowerCase(), f = $('resultState').value;
@@ -662,8 +669,7 @@ function renderResult() {
   const nPick = S.resPicked.size + S.resDbPicked.size;
   $('btnDropTarget').disabled = !nPick || !!(S.job && S.job.running);
   $('btnDropTarget').textContent = nPick ? `선택 삭제 (${nPick})` : '선택 삭제';
-  const keys = [...all].filter(k => (!q || k.toLowerCase().includes(q)) &&
-    (!f || (f === 'ok' ? resultStatus(k) === 'OK' : BAD.has(resultStatus(k)))));
+  const keys = resultShown(all);
   const by = groupByDb(keys);
   // 이번 실행에서 방금 만든 DB는 대상 목록을 다시 읽기 전이라도 있는 것으로 봄
   const tdb = new Set([...(S.tgtDbs || []), ...Object.keys(liveTargets()).map(k => split(k)[0])]);
@@ -681,7 +687,7 @@ function renderResult() {
         h('span', { class: 'st EMPTY', title: S.tgtTables ? '대상 클러스터에 DB는 있지만 테이블이 없습니다.' : '대상 클러스터에 DB는 있지만 이관 결과가 없습니다.' }, S.tgtTables ? '빈 DB' : '이관 결과 없음')));
       continue;
     }
-    const [open, node] = tgtDbNode('result', db, by[db], k => dropState(k) || resultStatus(k), S.resPicked); frag.append(node);
+    const [open, node] = tgtDbNode('result', db, by[db], k => dropState(k) || resultStatus(k), S.resPicked, !!q); frag.append(node);
     if (S.tgtDbs && !tdb.has(db)) node.append(h('span', { class: 'st NODB', title: '대상 클러스터에 이 DB가 없습니다 (다른 곳에서 삭제됨)' }, '대상에 DB 없음'));
     if (!open) continue;
     for (const k of by[db]) {
@@ -768,14 +774,45 @@ $('btnExpandSrc').onclick = async () => {
 $('btnCollapseSrc').onclick = () => { S.open.clear(); renderSource(); };
 for (const [pane, sfx] of [['list', 'List'], ['result', 'Result']]) {
   $('btnExpand' + sfx).onclick = () => {
-    for (const db of S.paneDbs[pane] || []) S.tgtOpen.delete(pane + ':' + db);
+    for (const db of S.paneDbs[pane] || []) S.tgtExpanded.add(pane + ':' + db);
     renderTarget();
   };
   $('btnCollapse' + sfx).onclick = () => {
-    for (const db of S.paneDbs[pane] || []) S.tgtOpen.add(pane + ':' + db);
+    for (const db of S.paneDbs[pane] || []) S.tgtExpanded.delete(pane + ':' + db);
     renderTarget();
   };
 }
+// 전체 선택 (칸마다): 지금 보이는 조건의 테이블을 모두 선택, 이미 모두 선택돼 있으면 해제
+function pickAll(set, keys) {
+  if (!keys.length) return false;
+  const on = !keys.every(k => set.has(k));
+  for (const k of keys) on ? set.add(k) : set.delete(k);
+  return true;
+}
+$('btnPickAllSrc').onclick = async () => {
+  const btn = $('btnPickAllSrc'); btn.disabled = true;
+  try {
+    let rows;
+    if (S.searchRows) rows = S.searchRows.rows;   // 검색 중: 검색 결과 안에서
+    else {   // 접힌 DB도 포함: 테이블 목록을 읽어 옴 (펼치기와 같은 방식, 8개씩)
+      const dbs = S.dbs.map(d => d.db);
+      for (let i = 0; i < dbs.length; i += 8) await Promise.all(dbs.slice(i, i + 8).map(db => ensureTables(db)));
+      rows = dbs.flatMap(db => S.tables[db].map(t => Object.assign({ db }, t)));
+    }
+    const keys = rows.filter(t => selectable(t) && srcFilter(t.db, t)).map(t => key(t.db, t.table));
+    if (!pickAll(S.picked, keys)) toast('선택할 테이블이 없습니다');
+  } finally { btn.disabled = false; }
+  renderSource();
+};
+$('btnPickAllList').onclick = () => {
+  const q = $('listSearch').value.trim().toLowerCase();
+  if (!pickAll(S.tgtPicked, S.queue.filter(k => !q || k.toLowerCase().includes(q)))) toast('이관 목록이 비어 있습니다');
+  renderList();
+};
+$('btnPickAllResult').onclick = () => {
+  if (!pickAll(S.resPicked, resultShown())) toast('선택할 결과가 없습니다');
+  renderResult();
+};
 $('btnTgtRefresh').onclick = async () => { $('btnTgtRefresh').disabled = true; await loadTargetDbs(true); $('btnTgtRefresh').disabled = false; };
 $('listSearch').oninput = renderList;
 $('resultSearch').oninput = $('resultState').onchange = renderResult;
